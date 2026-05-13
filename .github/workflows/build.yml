@@ -1,0 +1,54 @@
+name: Formulasyon-Optimizer Build
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Python Kurulumu
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Kutuphanelerin Kurulmasi
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+        pip install PyQt6
+        pip install numpy
+        pip install scipy
+        pip install pandas
+        pip install matplotlib
+        pip install statsmodels
+        pip install pyDOE3
+        pip install openpyxl
+        pip install reportlab
+        pip install pillow
+
+    - name: EXE Olusturma (ikon varsa)
+      run: |
+        if (Test-Path "opt_icon.ico") {
+          python -m PyInstaller --onefile --noconsole `
+            --icon=opt_icon.ico `
+            --name="Formulasyon_Optimizer" `
+            formulasyon_optimizer.py
+        } else {
+          python -m PyInstaller --onefile --noconsole `
+            --name="Formulasyon_Optimizer" `
+            formulasyon_optimizer.py
+        }
+      shell: pwsh
+
+    - name: EXE Yukle (Artifact)
+      uses: actions/upload-artifact@v4
+      with:
+        name: Formulasyon_Optimizer
+        path: dist/Formulasyon_Optimizer.exe
+        retention-days: 30
