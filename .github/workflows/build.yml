@@ -32,16 +32,27 @@ jobs:
         pip install reportlab
         pip install pillow
 
-    - name: EXE Olusturma (ikon varsa)
+    - name: pyDOE3 Veri Dosyalari Yolunu Bul
+      id: pydoe3_path
       run: |
+        $path = python -c "import pyDOE3; import os; print(os.path.dirname(pyDOE3.__file__))"
+        echo "PYDOE3_PATH=$path" >> $env:GITHUB_ENV
+        echo "pyDOE3 yolu: $path"
+      shell: pwsh
+
+    - name: EXE Olusturma
+      run: |
+        $pydoe3 = $env:PYDOE3_PATH
         if (Test-Path "opt_icon.ico") {
           python -m PyInstaller --onefile --noconsole `
             --icon=opt_icon.ico `
             --name="Formulasyon_Optimizer" `
+            --add-data "$pydoe3;pyDOE3" `
             formulasyon_optimizer.py
         } else {
           python -m PyInstaller --onefile --noconsole `
             --name="Formulasyon_Optimizer" `
+            --add-data "$pydoe3;pyDOE3" `
             formulasyon_optimizer.py
         }
       shell: pwsh
