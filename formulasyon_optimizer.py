@@ -852,6 +852,9 @@ class Tab1_Design(QWidget):
         self.lbl_oneri.setText(f"💡 Öneri: {info.get('oneri','')}")
 
     def _update_run_estimate(self):
+        # design_combo henüz oluşturulmamış olabilir (_add_factor __init__'te çağrılır)
+        if not hasattr(self, "design_combo") or not hasattr(self, "run_info_lbl"):
+            return
         design_type = self.design_combo.currentText()
         info = DESIGN_INFO.get(design_type, {})
         k = len(self._factor_rows)
