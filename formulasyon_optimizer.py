@@ -1283,7 +1283,11 @@ class Tab2_DataEntry(QWidget):
 
     def _go_to_model(self):
         """Sekme 3'e geç."""
-        filled = sum(1 for i in range(len(self.project.design_matrix or []))
+        dm = self.project.design_matrix
+        if dm is None:
+            QMessageBox.warning(self, "", "Önce Deney Tasarımı sekmesinden matris oluşturun.")
+            return
+        filled = sum(1 for i in range(len(dm))
                      if self.project.run_results.get(i))
         if filled == 0:
             QMessageBox.warning(self, "",
