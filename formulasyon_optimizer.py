@@ -1066,7 +1066,7 @@ class Tab2_DataEntry(QWidget):
         self.table = QTableWidget()
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet(self.table.styleSheet() + """
             QTableWidget { alternate-background-color: #111620; }
@@ -1399,17 +1399,30 @@ class ModelWorker(QThread):
                 X_mat = sm.add_constant(X_df, has_constant="add")
                 model = sm.OLS(y_s, X_mat).fit()
 
-                # ANOVA
+                # ANOVA — önce typ=1 dene, başarısız olursa manuel hesapla
+                anova = None
                 try:
                     from statsmodels.stats.anova import anova_lm as _anova_lm
-                    anova = _anova_lm(model, typ=2)
-                except Exception:
+                    anova = _anova_lm(model, typ=1)
+                except Exception as _e1:
                     try:
-                        from statsmodels.stats.anova import anova_lm as _anova_lm
-                        anova = _anova_lm(model, typ=1)
-                    except Exception as _e:
-                        anova = None
-                        write_log(f"ANOVA hesaplanamadı ({resp_key}): {_e}")
+                        ss_res = float(np.sum(model.resid**2))
+                        ss_tot = float(np.sum((y_s - float(y_s.mean()))**2))
+                        ss_reg = ss_tot - ss_res
+                        df_reg = int(model.df_model)
+                        df_res = int(model.df_resid)
+                        ms_reg = ss_reg / max(df_reg, 1)
+                        ms_res = ss_res / max(df_res, 1)
+                        f_val  = ms_reg / max(ms_res, 1e-10)
+                        from scipy.stats import f as _f_dist
+                        p_f    = float(1 - _f_dist.cdf(f_val, df_reg, df_res))
+                        anova  = pd.DataFrame({
+                            "sum_sq": [ss_reg, ss_res],
+                            "df":     [float(df_reg), float(df_res)],
+                            "PR(>F)": [p_f, float("nan")],
+                        }, index=["Model", "Artik"])
+                    except Exception as _e2:
+                        write_log(f"ANOVA hesaplanamadi ({resp_key}): {_e1} | {_e2}")
 
                 # Artık normallik testi (Shapiro-Wilk 3-5000 arası çalışır)
                 sw_p = None
@@ -1908,6 +1921,10 @@ class Tab4_ResponseSurface(QWidget):
             f"color:{TXT2}; font-size:11px; background:transparent;")
         bot.addWidget(self.status_lbl)
         bot.addStretch()
+        self.btn_reset_view = make_btn("↺  Görünümü Sıfırla", "rgba(30,50,90,0.8)", 32)
+        self.btn_reset_view.setToolTip("3D grafiği başlangıç açısına döndür")
+        self.btn_reset_view.clicked.connect(self._reset_3d_view)
+        bot.addWidget(self.btn_reset_view)
         self.btn_next = make_btn("Optimizasyon  ▶", "rgba(20,80,20,0.8)", 34)
         self.btn_next.setStyleSheet(self.btn_next.styleSheet() +
                                     "font-size:12px; font-weight:bold;")
@@ -2100,6 +2117,16 @@ class Tab4_ResponseSurface(QWidget):
         finally:
             self.btn_plot.setEnabled(True)
             self.btn_plot.setText("▶  Grafik Çiz")
+
+    def _reset_3d_view(self):
+        """3D yüzey grafiğini varsayılan açıya döndür."""
+        try:
+            for ax in self.fig.get_axes():
+                if hasattr(ax, 'elev'):
+                    ax.view_init(elev=30, azim=-60)
+            self.canvas.draw()
+        except Exception:
+            pass
 
     def _draw(self, resp_key, xi, yi, XX, YY, ZZ):
         from mpl_toolkits.mplot3d import Axes3D
@@ -2961,6 +2988,16 @@ class Tab6_DesignSpace(QWidget):
         self.canvas3d = FigureCanvas(self.fig3d)
         self.canvas3d.setStyleSheet(f"background:{BG2};")
         s3d_l.addWidget(self.canvas3d)
+        # Sıfırla butonu
+        s3d_bot = QHBoxLayout()
+        s3d_bot.addStretch()
+        btn_reset3d = make_btn("↺  Görünümü Sıfırla", "rgba(30,50,90,0.8)", 28)
+        btn_reset3d.setToolTip("3D grafiği başlangıç açısına döndür")
+        btn_reset3d.clicked.connect(self._reset_3d_scatter_view)
+        s3d_bot.addWidget(btn_reset3d)
+        s3d_bot.setContentsMargins(0,4,8,4)
+        s3d_bot_w = QWidget(); s3d_bot_w.setLayout(s3d_bot)
+        s3d_l.addWidget(s3d_bot_w)
         self.graph_tabs.addTab(self.scatter3d_w, "🔵  3D Faktör Uzayı")
 
         outer.addWidget(self.graph_tabs, 1)
@@ -3473,6 +3510,16 @@ class Tab6_DesignSpace(QWidget):
         self.btn_plot.setText("▶  Harita Çiz")
         QMessageBox.critical(self, "Hata", f"Design Space hesaplanamadı:\n{msg}")
         self.app.status_bar.showMessage("Hata oluştu.", 4000)
+
+    def _reset_3d_scatter_view(self):
+        """3D scatter grafiğini varsayılan açıya döndür."""
+        try:
+            for ax in self.fig3d.get_axes():
+                if hasattr(ax, 'elev'):
+                    ax.view_init(elev=25, azim=-60)
+            self.canvas3d.draw()
+        except Exception:
+            pass
 
     def _draw_3d_scatter(self, grids, xi, yi):
         """3D faktör uzayı scatter — run noktaları yeşil/kırmızı/sarı."""
@@ -4098,100 +4145,146 @@ class Tab7_Validation(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 # PDF RAPOR MODÜLÜ
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# PDF RAPOR MODÜLÜ v2 — Siyah/Beyaz, Türkçe Destekli
+# ═══════════════════════════════════════════════════════════════════════════════
 def generate_pdf_report(project, output_path):
-    """
-    Tüm proje verilerini PDF raporuna yazar.
-    reportlab kütüphanesi kullanır.
-    """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.lib.units import cm
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.styles import ParagraphStyle
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        PageBreak, Image, HRFlowable, KeepTogether
+        PageBreak, Image, HRFlowable
     )
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
-    import io, datetime
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import io, datetime, os
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
 
-    # ── Renkler ───────────────────────────────────────────────────────────────
-    NAVY_PDF  = colors.HexColor("#002D62")
-    GOLD_PDF  = colors.HexColor("#FFC600")
-    BG_PDF    = colors.HexColor("#0e1219")
-    GREEN_PDF = colors.HexColor("#00B050")
-    RED_PDF   = colors.HexColor("#C00000")
-    LIGHT     = colors.HexColor("#e0eaf8")
-    GRAY      = colors.HexColor("#7090b0")
-    WHITE     = colors.white
-    BLACK     = colors.black
-    ROW1      = colors.HexColor("#1c2336")
-    ROW2      = colors.HexColor("#141824")
+    # ── Türkçe Font Yükle ─────────────────────────────────────────────────────
+    def load_fonts():
+        """DejaVu fontlarını yükle — Türkçe karakter desteği."""
+        font_paths = [
+            # Linux
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            # Windows
+            r"C:\Windows\Fonts\DejaVuSans.ttf",
+            r"C:\Windows\Fonts\DejaVuSans-Bold.ttf",
+            # PyInstaller bundle
+            os.path.join(
+                getattr(__import__('sys'), '_MEIPASS', ''),
+                "DejaVuSans.ttf"),
+        ]
+        # DejaVu varsa yükle
+        reg_path  = None
+        bold_path = None
+        for p in font_paths:
+            if p and os.path.exists(p):
+                if "Bold" in p:
+                    bold_path = p
+                else:
+                    reg_path = p
+
+        if reg_path:
+            try:
+                pdfmetrics.registerFont(TTFont("DejaVuSans", reg_path))
+                if bold_path:
+                    pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", bold_path))
+                else:
+                    pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", reg_path))
+                return "DejaVuSans", "DejaVuSans-Bold"
+            except Exception:
+                pass
+
+        # Arial (Windows)
+        arial_paths = [
+            r"C:\Windows\Fonts\arial.ttf",
+            r"C:\Windows\Fonts\arialbd.ttf",
+        ]
+        if os.path.exists(arial_paths[0]):
+            try:
+                pdfmetrics.registerFont(TTFont("ArialTR", arial_paths[0]))
+                if os.path.exists(arial_paths[1]):
+                    pdfmetrics.registerFont(TTFont("ArialTR-Bold", arial_paths[1]))
+                else:
+                    pdfmetrics.registerFont(TTFont("ArialTR-Bold", arial_paths[0]))
+                return "ArialTR", "ArialTR-Bold"
+            except Exception:
+                pass
+
+        # Fallback — Helvetica (Türkçe karakter yok ama en azından çalışır)
+        return "Helvetica", "Helvetica-Bold"
+
+    FONT_REG, FONT_BOLD = load_fonts()
+
+    # ── Renkler (siyah/beyaz) ─────────────────────────────────────────────────
+    BLACK   = colors.black
+    WHITE   = colors.white
+    DGRAY   = colors.HexColor("#333333")
+    MGRAY   = colors.HexColor("#666666")
+    LGRAY   = colors.HexColor("#cccccc")
+    XLGRAY  = colors.HexColor("#f5f5f5")
 
     # ── Stiller ───────────────────────────────────────────────────────────────
-    styles = getSampleStyleSheet()
+    def S(name, font=None, size=10, color=BLACK,
+          align=TA_LEFT, before=4, after=4, bold=False):
+        return ParagraphStyle(
+            name=name,
+            fontName=FONT_BOLD if bold else (font or FONT_REG),
+            fontSize=size,
+            textColor=color,
+            alignment=align,
+            spaceBefore=before,
+            spaceAfter=after,
+        )
 
-    def make_style(name, fontName="Helvetica-Bold", fontSize=11,
-                   textColor=WHITE, alignment=TA_LEFT,
-                   spaceBefore=4, spaceAfter=4):
-        return ParagraphStyle(name=name, fontName=fontName,
-                              fontSize=fontSize, textColor=textColor,
-                              alignment=alignment,
-                              spaceBefore=spaceBefore, spaceAfter=spaceAfter)
+    s_title    = S("title",  size=20, align=TA_CENTER, bold=True,  before=20, after=6)
+    s_subtitle = S("sub",    size=11, align=TA_CENTER, color=DGRAY, before=4, after=20)
+    s_h1       = S("h1",     size=13, bold=True,  before=14, after=6)
+    s_h2       = S("h2",     size=10, bold=True,  before=8,  after=4)
+    s_body     = S("body",   size=9,  color=DGRAY, before=2, after=2)
+    s_small    = S("small",  size=8,  color=MGRAY, before=1, after=1)
+    s_center   = S("center", size=9,  align=TA_CENTER, before=2, after=2)
+    s_verdict  = S("verdict",size=14, bold=True, align=TA_CENTER, before=6, after=6)
 
-    s_title    = make_style("title",   fontSize=22, alignment=TA_CENTER,
-                             textColor=GOLD_PDF, spaceBefore=20, spaceAfter=8)
-    s_subtitle = make_style("subtitle", fontSize=12, alignment=TA_CENTER,
-                             textColor=LIGHT, fontName="Helvetica",
-                             spaceBefore=4, spaceAfter=20)
-    s_h1       = make_style("h1", fontSize=14, textColor=GOLD_PDF,
-                             spaceBefore=14, spaceAfter=6)
-    s_h2       = make_style("h2", fontSize=11, textColor=LIGHT,
-                             spaceBefore=8, spaceAfter=4)
-    s_body     = make_style("body", fontName="Helvetica", fontSize=9,
-                             textColor=LIGHT, spaceBefore=2, spaceAfter=2)
-    s_small    = make_style("small", fontName="Helvetica", fontSize=8,
-                             textColor=GRAY, spaceBefore=1, spaceAfter=1)
-    s_pass     = make_style("pass", fontName="Helvetica-Bold", fontSize=13,
-                             textColor=GREEN_PDF, alignment=TA_CENTER)
-    s_fail     = make_style("fail", fontName="Helvetica-Bold", fontSize=13,
-                             textColor=RED_PDF, alignment=TA_CENTER)
-    s_center   = make_style("center", fontName="Helvetica", fontSize=9,
-                             textColor=LIGHT, alignment=TA_CENTER)
-
-    # ── Tablo stili yardımcısı ────────────────────────────────────────────────
-    def base_table_style(header_bg=NAVY_PDF):
-        return TableStyle([
-            ("BACKGROUND",   (0,0), (-1,0),  header_bg),
-            ("TEXTCOLOR",    (0,0), (-1,0),  WHITE),
-            ("FONTNAME",     (0,0), (-1,0),  "Helvetica-Bold"),
-            ("FONTSIZE",     (0,0), (-1,0),  8),
+    # ── Tablo stili (siyah/beyaz, arka plan yok) ──────────────────────────────
+    def tbl_style(has_header=True):
+        cmds = [
             ("ALIGN",        (0,0), (-1,-1), "CENTER"),
             ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
-            ("FONTNAME",     (0,1), (-1,-1), "Helvetica"),
-            ("FONTSIZE",     (0,1), (-1,-1), 8),
-            ("TEXTCOLOR",    (0,1), (-1,-1), LIGHT),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1), [ROW1, ROW2]),
-            ("GRID",         (0,0), (-1,-1), 0.4, colors.HexColor("#2a4060")),
+            ("FONTNAME",     (0,0), (-1,-1), FONT_REG),
+            ("FONTSIZE",     (0,0), (-1,-1), 8),
+            ("TEXTCOLOR",    (0,0), (-1,-1), BLACK),
+            ("GRID",         (0,0), (-1,-1), 0.5, LGRAY),
             ("TOPPADDING",   (0,0), (-1,-1), 3),
             ("BOTTOMPADDING",(0,0), (-1,-1), 3),
             ("LEFTPADDING",  (0,0), (-1,-1), 5),
             ("RIGHTPADDING", (0,0), (-1,-1), 5),
-        ])
+        ]
+        if has_header:
+            cmds += [
+                ("FONTNAME",  (0,0), (-1,0), FONT_BOLD),
+                ("FONTSIZE",  (0,0), (-1,0), 8),
+                ("LINEBELOW", (0,0), (-1,0), 1.0, BLACK),
+            ]
+        return TableStyle(cmds)
 
-    # ── Matplotlib fig → PIL buffer ────────────────────────────────────────────
-    def fig_to_image(fig, width_cm=16, height_cm=8):
+    # ── Matplotlib fig → Image ────────────────────────────────────────────────
+    def fig_to_img(fig, w_cm=15, h_cm=7):
         buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=120,
-                    bbox_inches="tight", facecolor=fig.get_facecolor())
+        fig.savefig(buf, format="png", dpi=130,
+                    bbox_inches="tight", facecolor="white")
         buf.seek(0)
-        return Image(buf, width=width_cm*cm, height=height_cm*cm)
+        return Image(buf, width=w_cm*cm, height=h_cm*cm)
 
-    # ── Grafik üret: Kontur haritası ──────────────────────────────────────────
-    def make_contour_image(resp_key, project):
+    # ── Kontur haritası üret ──────────────────────────────────────────────────
+    def make_contour(resp_key):
         try:
             import statsmodels.api as sm
             p = project; safe = p.get_safe_names()
@@ -4201,590 +4294,454 @@ def generate_pdf_report(project, output_path):
             xi, yi = 0, 1
             fx = factors[xi]; fy = factors[yi]
             n = 40
-            x_arr = np.linspace(fx["low"], fx["high"], n)
-            y_arr = np.linspace(fy["low"], fy["high"], n)
-            XX, YY = np.meshgrid(x_arr, y_arr)
+            x_a = np.linspace(fx["low"], fx["high"], n)
+            y_a = np.linspace(fy["low"], fy["high"], n)
+            XX, YY = np.meshgrid(x_a, y_a)
             ZZ = np.full_like(XX, np.nan)
-            res = p.model_results[resp_key]
-            model = res["model"]
+            model = p.model_results[resp_key]["model"]
             param_idx = model.params.index
 
-            def encode(val, f):
+            def enc(v, f):
                 lo, hi = f["low"], f["high"]
                 mid = f.get("mid", (lo+hi)/2)
                 if hi == lo: return 0.0
-                if val <= mid and (mid-lo) != 0:
-                    return (val-lo)/(mid-lo) - 1
+                if v <= mid and (mid-lo) != 0:
+                    return (v-lo)/(mid-lo) - 1
                 elif (hi-mid) != 0:
-                    return (val-mid)/(hi-mid)
+                    return (v-mid)/(hi-mid)
                 return 0.0
 
             for r in range(n):
                 for c in range(n):
                     row = {}
                     for k, f in enumerate(factors):
-                        row[safe[k]] = encode(XX[r,c] if k==xi else
-                                              YY[r,c] if k==yi else
-                                              f.get("mid",(f["low"]+f["high"])/2), f)
-                    for name in safe:
-                        row[f"{name}_sq"] = row[name]**2
+                        row[safe[k]] = enc(
+                            XX[r,c] if k==xi else YY[r,c] if k==yi
+                            else f.get("mid",(f["low"]+f["high"])/2), f)
+                    for nm in safe:
+                        row[f"{nm}_sq"] = row[nm]**2
                     for a in range(n_f):
                         for b in range(a+1, n_f):
                             row[f"{safe[a]}_x_{safe[b]}"] = row[safe[a]]*row[safe[b]]
-                    df_row = pd.DataFrame([row])
-                    row_mat = sm.add_constant(df_row, has_constant="add")
+                    df_r = pd.DataFrame([row])
+                    rm = sm.add_constant(df_r, has_constant="add")
                     for col in param_idx:
-                        if col not in row_mat.columns:
-                            row_mat[col] = 0.0
-                    row_mat = row_mat.reindex(columns=param_idx, fill_value=0.0)
-                    try:
-                        ZZ[r, c] = float(model.predict(row_mat)[0])
-                    except Exception:
-                        pass
+                        if col not in rm.columns: rm[col] = 0.0
+                    rm = rm.reindex(columns=param_idx, fill_value=0.0)
+                    try: ZZ[r, c] = float(model.predict(rm)[0])
+                    except: pass
 
-            fig, ax = plt.subplots(figsize=(7, 4),
-                                   facecolor="#141824")
-            ax.set_facecolor("#1c2336")
-            cf = ax.contourf(XX, YY, ZZ, levels=20, cmap="viridis", alpha=0.9)
-            ax.contour(XX, YY, ZZ, levels=20, colors="white",
-                       alpha=0.2, linewidths=0.4)
+            fig, ax = plt.subplots(figsize=(7, 4.5), facecolor="white")
+            ax.set_facecolor("white")
+            cf = ax.contourf(XX, YY, ZZ, levels=20, cmap="Blues")
+            ax.contour(XX, YY, ZZ, levels=20, colors="gray",
+                       alpha=0.4, linewidths=0.3)
             cb = fig.colorbar(cf, ax=ax)
-            cb.ax.tick_params(colors="#7090b0", labelsize=7)
-            cb.set_label(RESPONSE_LABELS.get(resp_key, resp_key),
-                         color="#7090b0", fontsize=8)
+            cb.ax.tick_params(labelsize=7)
+            cb.set_label(RESPONSE_LABELS.get(resp_key, resp_key), fontsize=8)
             ax.set_xlabel(fx["name"] + (f" ({fx['unit']})" if fx.get("unit") else ""),
-                          color="#7090b0", fontsize=8)
+                          fontsize=8)
             ax.set_ylabel(fy["name"] + (f" ({fy['unit']})" if fy.get("unit") else ""),
-                          color="#7090b0", fontsize=8)
-            ax.set_title(f"{RESPONSE_LABELS.get(resp_key, resp_key)} — Kontur Haritası",
-                         color="#FFC600", fontsize=9)
-            ax.tick_params(colors="#7090b0", labelsize=7)
-            img = fig_to_image(fig, 14, 6)
+                          fontsize=8)
+            ax.set_title(RESPONSE_LABELS.get(resp_key, resp_key) + " Kontur Haritasi",
+                         fontsize=9)
+            ax.tick_params(labelsize=7)
+            img = fig_to_img(fig, 14, 6)
             plt.close(fig)
             return img
         except Exception:
             return None
 
-    # ── Grafik üret: Desirability bar ─────────────────────────────────────────
-    def make_desirability_image(solutions):
+    # ── Desirability grafiği ──────────────────────────────────────────────────
+    def make_desirability_img(solutions):
         try:
-            fig, ax = plt.subplots(figsize=(8, 2.5), facecolor="#141824")
-            ax.set_facecolor("#1c2336")
+            fig, ax = plt.subplots(figsize=(8, 2.5), facecolor="white")
+            ax.set_facecolor("white")
             labels = [f"#{i+1}" for i in range(len(solutions))]
-            values = [s["desirability"] for s in solutions]
-            bar_colors = ["#00B050" if v >= 0.8 else
-                          "#FFC600" if v >= 0.5 else "#C00000" for v in values]
-            bars = ax.bar(labels, values, color=bar_colors, alpha=0.85,
-                          edgecolor="#2a4060")
+            vals   = [s["desirability"] for s in solutions]
+            bars   = ax.bar(labels, vals, color="steelblue", alpha=0.8,
+                            edgecolor="black", linewidth=0.6)
             ax.set_ylim(0, 1.1)
-            ax.axhline(0.8, color="#00B050", lw=1, linestyle="--", alpha=0.6)
-            ax.axhline(0.5, color="#FFC600", lw=1, linestyle="--", alpha=0.6)
-            ax.set_ylabel("Desirability", color="#7090b0", fontsize=8)
-            ax.set_title("Top-5 Desirability Skoru", color="#FFC600", fontsize=9)
-            ax.tick_params(colors="#7090b0", labelsize=8)
-            for bar, val in zip(bars, values):
+            ax.axhline(0.8, color="green",  lw=1, linestyle="--", alpha=0.7)
+            ax.axhline(0.5, color="orange", lw=1, linestyle="--", alpha=0.7)
+            ax.set_ylabel("Desirability", fontsize=8)
+            ax.set_title("Top-5 Desirability Skoru", fontsize=9)
+            ax.tick_params(labelsize=8)
+            for bar, val in zip(bars, vals):
                 ax.text(bar.get_x() + bar.get_width()/2, val + 0.02,
-                        f"{val:.3f}", ha="center", color="#e0eaf8", fontsize=8)
-            img = fig_to_image(fig, 14, 4)
+                        f"{val:.3f}", ha="center", fontsize=8)
+            img = fig_to_img(fig, 12, 4)
             plt.close(fig)
             return img
         except Exception:
             return None
 
     # ── Sayfa numaralandırma ──────────────────────────────────────────────────
-    page_num = [0]
-    def on_page(canvas_obj, doc):
-        page_num[0] += 1
-        canvas_obj.saveState()
-        canvas_obj.setFillColor(NAVY_PDF)
-        canvas_obj.rect(0, 0, A4[0], 1.2*cm, fill=1, stroke=0)
-        canvas_obj.setFillColor(GOLD_PDF)
-        canvas_obj.setFont("Helvetica-Bold", 8)
-        canvas_obj.drawString(1.5*cm, 0.4*cm, "Formulasyon-Optimizer  v1")
-        canvas_obj.drawRightString(A4[0]-1.5*cm, 0.4*cm,
-                                   f"Sayfa {page_num[0]}")
-        canvas_obj.setFillColor(GRAY)
-        canvas_obj.drawCentredString(A4[0]/2, 0.4*cm,
-                                     datetime.datetime.now().strftime("%d.%m.%Y %H:%M"))
-        canvas_obj.restoreState()
+    pn = [0]
+    def on_page(cv, doc):
+        pn[0] += 1
+        cv.saveState()
+        cv.setStrokeColor(LGRAY)
+        cv.line(1.8*cm, 1.5*cm, A4[0]-1.8*cm, 1.5*cm)
+        cv.setFont(FONT_REG, 8)
+        cv.setFillColor(MGRAY)
+        cv.drawString(1.8*cm, 0.8*cm, "Formulasyon-Optimizer  v1")
+        cv.drawRightString(A4[0]-1.8*cm, 0.8*cm, f"Sayfa {pn[0]}")
+        cv.drawCentredString(A4[0]/2, 0.8*cm,
+                             datetime.datetime.now().strftime("%d.%m.%Y %H:%M"))
+        cv.restoreState()
 
-    # ── Belge oluştur ─────────────────────────────────────────────────────────
+    # ── Belge ─────────────────────────────────────────────────────────────────
     doc = SimpleDocTemplate(
-        output_path,
-        pagesize=A4,
+        output_path, pagesize=A4,
         leftMargin=1.8*cm, rightMargin=1.8*cm,
-        topMargin=2.0*cm,  bottomMargin=2.0*cm,
+        topMargin=2.0*cm,  bottomMargin=2.2*cm,
     )
-
+    W = A4[0] - 3.6*cm
     story = []
-    W = A4[0] - 3.6*cm   # Kullanılabilir genişlik
 
-    # ════════════════════════════════════════════════════════════════
-    # BÖLÜM 1 — KAPAK
-    # ════════════════════════════════════════════════════════════════
-    story.append(Spacer(1, 2*cm))
+    def hr():
+        return HRFlowable(width="100%", thickness=0.5,
+                          color=BLACK, spaceAfter=8)
+
+    def section(title, num):
+        story.append(Spacer(1, 0.2*cm))
+        story.append(Paragraph(f"{num}. {title}", s_h1))
+        story.append(hr())
+
+    # ════════════════════════════════════════
+    # KAPAK
+    # ════════════════════════════════════════
+    story.append(Spacer(1, 2.5*cm))
     story.append(Paragraph("Formulasyon-Optimizer", s_title))
-    story.append(Paragraph("Farmasötik İnhaler Formülasyon Geliştirme &amp; Optimizasyon Raporu",
-                            s_subtitle))
-    story.append(HRFlowable(width="100%", thickness=2,
-                             color=GOLD_PDF, spaceAfter=20))
+    story.append(Paragraph(
+        "Farmasotik Inhaler Formülasyon Gelistirme ve Optimizasyon Raporu",
+        s_subtitle))
+    story.append(hr())
 
-    # Proje özet tablosu
-    now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
     dm  = project.design_matrix
-    cover_data = [
-        ["Parametre", "Değer"],
-        ["Rapor Tarihi",   now],
-        ["Tasarım Tipi",   project.design_type],
-        ["Faktör Sayısı",  str(len(project.factors))],
-        ["Run Sayısı",     str(len(dm)) if dm is not None else "—"],
-        ["Yanıt Sayısı",   str(len(project.responses))],
-        ["Model Durumu",   f"{len(project.model_results)} yanıt modellendi"
-                           if project.model_results else "Model kurulmadı"],
-        ["Optimizasyon",   f"{len(project.opt_solutions)} çözüm bulundu"
-                           if project.opt_solutions else "Henüz yapılmadı"],
+    now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+    cov = [
+        ["Parametre", "Deger"],
+        ["Rapor Tarihi",  now],
+        ["Tasarim Tipi",  project.design_type],
+        ["Faktor Sayisi", str(len(project.factors))],
+        ["Run Sayisi",    str(len(dm)) if dm is not None else "-"],
+        ["Yanit Sayisi",  str(len(project.responses))],
+        ["Model",         f"{len(project.model_results)} yanit modellendi"
+                          if project.model_results else "Kurulmadi"],
+        ["Optimizasyon",  f"{len(project.opt_solutions)} cozum bulundu"
+                          if project.opt_solutions else "Yapilmadi"],
     ]
-    cover_tbl = Table(cover_data, colWidths=[W*0.4, W*0.6])
-    cover_tbl.setStyle(base_table_style())
-    story.append(cover_tbl)
+    ct = Table(cov, colWidths=[W*0.4, W*0.6])
+    ct.setStyle(tbl_style())
+    story.append(ct)
     story.append(PageBreak())
 
-    # ════════════════════════════════════════════════════════════════
-    # BÖLÜM 2 — DENEY TASARIMI
-    # ════════════════════════════════════════════════════════════════
-    story.append(Paragraph("1. Deney Tasarımı", s_h1))
-    story.append(HRFlowable(width="100%", thickness=1,
-                             color=NAVY_PDF, spaceAfter=8))
+    # ════════════════════════════════════════
+    # 1. DENEY TASARIMI
+    # ════════════════════════════════════════
+    section("Deney Tasarimi", 1)
 
-    # Faktör tablosu
-    story.append(Paragraph("1.1 Faktörler", s_h2))
-    f_hdr = ["Faktör", "Birim", "Alt Seviye", "Orta Seviye", "Üst Seviye"]
-    f_data = [f_hdr]
-    for f in project.factors:
-        f_data.append([
-            f["name"], f.get("unit","—"),
-            f"{f['low']:.4g}", f"{f.get('mid',(f['low']+f['high'])/2):.4g}",
-            f"{f['high']:.4g}",
-        ])
-    f_tbl = Table(f_data, colWidths=[W*0.28, W*0.12,
-                                      W*0.20, W*0.20, W*0.20])
-    f_tbl.setStyle(base_table_style())
-    story.append(f_tbl)
+    story.append(Paragraph("1.1 Faktorler", s_h2))
+    fh = ["Faktor", "Birim", "Alt", "Orta", "Ust"]
+    fd = [fh] + [
+        [f["name"], f.get("unit","-"),
+         f"{f['low']:.4g}",
+         f"{f.get('mid',(f['low']+f['high'])/2):.4g}",
+         f"{f['high']:.4g}"]
+        for f in project.factors
+    ]
+    ft = Table(fd, colWidths=[W*0.30,W*0.12,W*0.19,W*0.19,W*0.20])
+    ft.setStyle(tbl_style())
+    story.append(ft)
     story.append(Spacer(1, 0.4*cm))
 
-    # Deney matrisi
     if dm is not None:
         story.append(Paragraph("1.2 Deney Matrisi", s_h2))
-        resp_labels = [RESPONSE_LABELS.get(r, r) for r in project.responses]
-        m_hdr = ["Run"] + [f["name"] for f in project.factors] + resp_labels
-        m_data = [m_hdr]
+        mh = (["Run"] + [f["name"] for f in project.factors] +
+              [RESPONSE_LABELS.get(r,r) for r in project.responses])
+        md = [mh]
         for ri in range(len(dm)):
-            row_vals = [str(ri+1)]
+            row = [str(ri+1)]
             for f in project.factors:
-                row_vals.append(f"{dm.iloc[ri][f['name']]:.4g}")
+                row.append(f"{dm.iloc[ri][f['name']]:.4g}")
             for resp in project.responses:
-                v = project.run_results.get(ri, {}).get(resp, "")
-                row_vals.append(f"{v:.4g}" if isinstance(v, float) else "—")
-            m_data.append(row_vals)
-
-        n_cols = len(m_hdr)
-        col_w  = W / n_cols
-        m_tbl  = Table(m_data, colWidths=[col_w]*n_cols, repeatRows=1)
-        style  = base_table_style()
-        # Yanıt sütunlarını vurgula
-        n_fact = len(project.factors)
-        for ci in range(1+n_fact, n_cols):
-            style.add("BACKGROUND", (ci,1), (ci,-1),
-                      colors.HexColor("#0d2010"))
-        m_tbl.setStyle(style)
-        story.append(m_tbl)
+                v = project.run_results.get(ri,{}).get(resp,"")
+                row.append(f"{v:.4g}" if isinstance(v, float) else "-")
+            md.append(row)
+        nc = len(mh)
+        mt = Table(md, colWidths=[W/nc]*nc, repeatRows=1)
+        mt.setStyle(tbl_style())
+        story.append(mt)
     else:
-        story.append(Paragraph("Deney matrisi oluşturulmadı.", s_body))
-
+        story.append(Paragraph("Deney matrisi olusturulmadi.", s_body))
     story.append(PageBreak())
 
-    # ════════════════════════════════════════════════════════════════
-    # BÖLÜM 3 — MODEL ÖZETİ
-    # ════════════════════════════════════════════════════════════════
-    story.append(Paragraph("2. Model Özeti", s_h1))
-    story.append(HRFlowable(width="100%", thickness=1,
-                             color=NAVY_PDF, spaceAfter=8))
+    # ════════════════════════════════════════
+    # 2. MODEL
+    # ════════════════════════════════════════
+    section("Model Ozeti", 2)
 
     if not project.model_results:
-        story.append(Paragraph("Model henüz kurulmadı.", s_body))
+        story.append(Paragraph("Model henuz kurulmadi.", s_body))
     else:
-        # Özet istatistikler tablosu
-        story.append(Paragraph("2.1 Model İstatistikleri", s_h2))
-        stat_hdr = ["Yanıt", "R²", "Adj R²", "RMSE", "F p-değeri", "Shapiro-Wilk p", "n"]
-        stat_data = [stat_hdr]
-        for resp_key in project.responses:
-            res = project.model_results.get(resp_key)
-            if res is None:
-                err = project.model_errors.get(resp_key, "—")
-                stat_data.append([RESPONSE_LABELS.get(resp_key,resp_key),
-                                   "HATA", "—","—","—","—","—"])
+        story.append(Paragraph("2.1 Model Istatistikleri", s_h2))
+        sh = ["Yanit","R2","Adj R2","RMSE","F p","SW p","n"]
+        sd = [sh]
+        for rk in project.responses:
+            res = project.model_results.get(rk)
+            if not res:
+                sd.append([RESPONSE_LABELS.get(rk,rk),"HATA","-","-","-","-","-"])
                 continue
             sw = res.get("sw_p")
-            stat_data.append([
-                RESPONSE_LABELS.get(resp_key, resp_key),
+            r2a = res['r2_adj']
+            rmse = res['rmse']
+            sd.append([
+                RESPONSE_LABELS.get(rk,rk),
                 f"{res['r2']:.4f}",
-                f"{res['r2_adj']:.4f}" if not (isinstance(res['r2_adj'], float)
-                                                and np.isnan(res['r2_adj'])) else "nan",
-                f"{res['rmse']:.4f}"   if not (isinstance(res['rmse'], float)
-                                                and np.isnan(res['rmse']))   else "nan",
+                f"{r2a:.4f}" if not (isinstance(r2a,float) and np.isnan(r2a)) else "nan",
+                f"{rmse:.4f}" if not (isinstance(rmse,float) and np.isnan(rmse)) else "nan",
                 f"{res['f_pvalue']:.4f}",
-                f"{sw:.4f}" if sw else "—",
+                f"{sw:.4f}" if sw else "-",
                 str(res["n_obs"]),
             ])
-        stat_tbl = Table(stat_data,
-                         colWidths=[W*0.20, W*0.10, W*0.10,
-                                    W*0.12, W*0.14, W*0.20, W*0.08],
-                         repeatRows=1)
-        stat_style = base_table_style()
-        # R² renklendirme
-        for ri, resp_key in enumerate(project.responses, 1):
-            res = project.model_results.get(resp_key)
-            if res:
-                r2 = res["r2"]
-                col = GREEN_PDF if r2 >= 0.9 else GOLD_PDF if r2 >= 0.7 else RED_PDF
-                stat_style.add("TEXTCOLOR", (1,ri), (1,ri), col)
-        stat_tbl.setStyle(stat_style)
-        story.append(stat_tbl)
+        st2 = Table(sd, colWidths=[W*0.22,W*0.10,W*0.10,W*0.12,W*0.14,W*0.20,W*0.08],
+                    repeatRows=1)
+        st2.setStyle(tbl_style())
+        story.append(st2)
         story.append(Spacer(1, 0.4*cm))
 
-        # Katsayı tabloları
-        for resp_key in project.responses:
-            res = project.model_results.get(resp_key)
-            if res is None:
-                continue
+        for rk in project.responses:
+            res = project.model_results.get(rk)
+            if not res: continue
             story.append(Paragraph(
-                f"2.2 Katsayılar — {RESPONSE_LABELS.get(resp_key, resp_key)}", s_h2))
-            model  = res["model"]
-            params = model.params
-            bse    = model.bse
-            tv     = model.tvalues
-            pv     = model.pvalues
-            c_data = [["Terim", "Katsayı", "Std Hata", "t", "p"]]
-            for name in params.index:
-                p_val = pv[name]
-                sig   = not (isinstance(p_val, float) and np.isnan(p_val)) and p_val < 0.05
-                c_data.append([
-                    name,
-                    f"{params[name]:.4f}",
-                    f"{bse[name]:.4f}" if not np.isinf(bse[name]) else "inf",
-                    f"{tv[name]:.3f}"  if not np.isnan(tv[name])  else "nan",
-                    f"{p_val:.4f}"     if not np.isnan(p_val)     else "nan",
+                f"2.2 Katsayilar — {RESPONSE_LABELS.get(rk,rk)}", s_h2))
+            model = res["model"]
+            cd = [["Terim","Katsayi","Std Hata","t","p"]]
+            for nm in model.params.index:
+                pv = model.pvalues[nm]
+                cd.append([
+                    nm,
+                    f"{model.params[nm]:.4f}",
+                    f"{model.bse[nm]:.4f}" if not np.isinf(model.bse[nm]) else "inf",
+                    f"{model.tvalues[nm]:.3f}" if not np.isnan(model.tvalues[nm]) else "nan",
+                    f"{pv:.4f}" if not np.isnan(pv) else "nan",
                 ])
-            c_tbl = Table(c_data, colWidths=[W*0.35, W*0.16,
-                                              W*0.16, W*0.16, W*0.17],
-                          repeatRows=1)
-            c_style = base_table_style()
-            for ri2, name in enumerate(params.index, 1):
-                p_val = pv[name]
-                if not (isinstance(p_val, float) and np.isnan(p_val)) and p_val < 0.05:
-                    c_style.add("BACKGROUND", (0,ri2), (-1,ri2),
-                                colors.HexColor("#0a2a0a"))
-                    c_style.add("TEXTCOLOR",  (0,ri2), (0,ri2), GREEN_PDF)
-            c_tbl.setStyle(c_style)
-            story.append(c_tbl)
+            ctt = Table(cd, colWidths=[W*0.35,W*0.16,W*0.16,W*0.16,W*0.17],
+                        repeatRows=1)
+            ctt.setStyle(tbl_style())
+            story.append(ctt)
             story.append(Spacer(1, 0.3*cm))
 
-        # ANOVA
-        for resp_key in project.responses:
-            res = project.model_results.get(resp_key)
-            if res is None or res.get("anova") is None:
-                continue
-            anova = res["anova"]
-            story.append(Paragraph(
-                f"2.3 ANOVA — {RESPONSE_LABELS.get(resp_key, resp_key)}", s_h2))
-            a_data = [["Kaynak", "SS", "df", "MS", "p"]]
-            for src_name, row in anova.iterrows():
-                p_v = row.get("PR(>F)", float("nan"))
-                ss  = row.get("sum_sq", 0)
-                df_ = row.get("df", 1)
-                a_data.append([
-                    str(src_name),
-                    f"{ss:.4f}",
-                    f"{int(df_)}",
-                    f"{ss/max(df_,1):.4f}",
-                    f"{p_v:.4f}" if not np.isnan(p_v) else "—",
-                ])
-            a_tbl = Table(a_data, colWidths=[W*0.35, W*0.16,
-                                              W*0.10, W*0.16, W*0.17],
-                          repeatRows=1)
-            a_style = base_table_style()
-            for ri3, (src_name, row) in enumerate(anova.iterrows(), 1):
-                p_v = row.get("PR(>F)", float("nan"))
-                if not np.isnan(p_v) and p_v < 0.05:
-                    a_style.add("TEXTCOLOR", (4,ri3), (4,ri3), GREEN_PDF)
-            a_tbl.setStyle(a_style)
-            story.append(a_tbl)
-            story.append(Spacer(1, 0.3*cm))
+            anova = res.get("anova")
+            if anova is not None:
+                story.append(Paragraph(
+                    f"2.3 ANOVA — {RESPONSE_LABELS.get(rk,rk)}", s_h2))
+                ad = [["Kaynak","SS","df","MS","p"]]
+                for sn, row in anova.iterrows():
+                    pv = row.get("PR(>F)", float("nan"))
+                    ss = row.get("sum_sq", 0)
+                    df_ = row.get("df", 1)
+                    ad.append([
+                        str(sn),
+                        f"{ss:.4f}",
+                        f"{int(df_)}",
+                        f"{ss/max(df_,1):.4f}",
+                        f"{pv:.4f}" if not np.isnan(pv) else "-",
+                    ])
+                att = Table(ad, colWidths=[W*0.35,W*0.16,W*0.10,W*0.16,W*0.17],
+                            repeatRows=1)
+                att.setStyle(tbl_style())
+                story.append(att)
+                story.append(Spacer(1, 0.3*cm))
 
     story.append(PageBreak())
 
-    # ════════════════════════════════════════════════════════════════
-    # BÖLÜM 4 — RESPONSE SURFACE GRAFİKLERİ
-    # ════════════════════════════════════════════════════════════════
-    story.append(Paragraph("3. Response Surface Grafikleri", s_h1))
-    story.append(HRFlowable(width="100%", thickness=1,
-                             color=NAVY_PDF, spaceAfter=8))
-
+    # ════════════════════════════════════════
+    # 3. RESPONSE SURFACE
+    # ════════════════════════════════════════
+    section("Response Surface Grafikleri", 3)
     if not project.model_results:
-        story.append(Paragraph("Model kurulmadı — grafik oluşturulamadı.", s_body))
+        story.append(Paragraph("Model kurulmadi.", s_body))
     else:
-        for resp_key in project.responses:
-            if resp_key not in project.model_results:
-                continue
+        for i, rk in enumerate(project.responses):
+            if rk not in project.model_results: continue
             story.append(Paragraph(
-                f"3.{project.responses.index(resp_key)+1}  "
-                f"{RESPONSE_LABELS.get(resp_key, resp_key)}", s_h2))
-            img = make_contour_image(resp_key, project)
+                f"3.{i+1}  {RESPONSE_LABELS.get(rk,rk)}", s_h2))
+            img = make_contour(rk)
             if img:
                 story.append(img)
             else:
-                story.append(Paragraph("Grafik oluşturulamadı.", s_small))
+                story.append(Paragraph("Grafik olusturulamadi.", s_small))
             story.append(Spacer(1, 0.3*cm))
-
     story.append(PageBreak())
 
-    # ════════════════════════════════════════════════════════════════
-    # BÖLÜM 5 — OPTİMİZASYON SONUÇLARI
-    # ════════════════════════════════════════════════════════════════
-    story.append(Paragraph("4. Optimizasyon Sonuçları", s_h1))
-    story.append(HRFlowable(width="100%", thickness=1,
-                             color=NAVY_PDF, spaceAfter=8))
-
-    if not project.spec_limits:
-        story.append(Paragraph("Spesifikasyon sınırları tanımlanmadı.", s_body))
-    else:
-        # Spec tablosu
-        story.append(Paragraph("4.1 Spesifikasyon Sınırları", s_h2))
-        sp_data = [["Yanıt", "Hedef", "LSL", "USL", "Hedef Değer", "Ağırlık (s)"]]
-        for resp_key, spec in project.spec_limits.items():
-            sp_data.append([
-                RESPONSE_LABELS.get(resp_key, resp_key),
-                spec.get("goal","—"),
-                f"{spec['lsl']:.4g}" if spec.get("lsl") is not None else "—",
-                f"{spec['usl']:.4g}" if spec.get("usl") is not None else "—",
-                f"{spec['target']:.4g}" if spec.get("target") is not None else "—",
-                f"{spec.get('weight',1.0):.1f}",
+    # ════════════════════════════════════════
+    # 4. OPTİMİZASYON
+    # ════════════════════════════════════════
+    section("Optimizasyon Sonuclari", 4)
+    if project.spec_limits:
+        story.append(Paragraph("4.1 Spesifikasyon Sinirlari", s_h2))
+        sph = ["Yanit","Hedef","LSL","USL","Hedef Deger","Agirlik s"]
+        spd = [sph]
+        for rk, sp in project.spec_limits.items():
+            spd.append([
+                RESPONSE_LABELS.get(rk,rk),
+                sp.get("goal","-"),
+                f"{sp['lsl']:.4g}" if sp.get("lsl") is not None else "-",
+                f"{sp['usl']:.4g}" if sp.get("usl") is not None else "-",
+                f"{sp['target']:.4g}" if sp.get("target") is not None else "-",
+                f"{sp.get('weight',1.0):.1f}",
             ])
-        sp_tbl = Table(sp_data, colWidths=[W*0.25, W*0.13,
-                                            W*0.12, W*0.12, W*0.20, W*0.18])
-        sp_tbl.setStyle(base_table_style())
-        story.append(sp_tbl)
+        spt = Table(spd, colWidths=[W*0.25,W*0.13,W*0.12,W*0.12,W*0.20,W*0.18])
+        spt.setStyle(tbl_style())
+        story.append(spt)
         story.append(Spacer(1, 0.4*cm))
 
-    if not project.opt_solutions:
-        story.append(Paragraph("Optimizasyon sonucu bulunamadı.", s_body))
-    else:
-        # Top-5 çözüm tablosu
+    if project.opt_solutions:
         story.append(Paragraph("4.2 Top-5 Optimum Formülasyon", s_h2))
-        sol_hdr = (["Sıra", "Desirability"] +
-                   [f["name"] for f in project.factors] +
-                   [RESPONSE_LABELS.get(r,r) for r in project.responses
-                    if r in project.model_results])
-        sol_data = [sol_hdr]
+        sh2 = (["Sira","Desirability"] +
+               [f["name"] for f in project.factors] +
+               [RESPONSE_LABELS.get(r,r) for r in project.responses
+                if r in project.model_results])
+        sd2 = [sh2]
         for rank, sol in enumerate(project.opt_solutions):
             row = [f"#{rank+1}", f"{sol['desirability']:.4f}"]
             for f in project.factors:
                 row.append(f"{sol['factors'].get(f['name'],0):.4g}")
-            for resp_key in project.responses:
-                if resp_key in project.model_results:
-                    pv = sol["predictions"].get(resp_key)
-                    row.append(f"{pv:.4f}" if pv is not None else "—")
-            sol_data.append(row)
-
-        n_sc = len(sol_hdr)
-        sol_tbl = Table(sol_data,
-                        colWidths=[W/n_sc]*n_sc, repeatRows=1)
-        sol_style = base_table_style()
-        for ri, sol in enumerate(project.opt_solutions, 1):
-            d = sol["desirability"]
-            col = GREEN_PDF if d >= 0.8 else GOLD_PDF if d >= 0.5 else RED_PDF
-            sol_style.add("TEXTCOLOR", (1,ri), (1,ri), col)
-        sol_tbl.setStyle(sol_style)
-        story.append(sol_tbl)
-        story.append(Spacer(1, 0.4*cm))
-
-        # Desirability grafiği
-        d_img = make_desirability_image(project.opt_solutions)
-        if d_img:
-            story.append(d_img)
-
+            for rk in project.responses:
+                if rk in project.model_results:
+                    pv = sol["predictions"].get(rk)
+                    row.append(f"{pv:.4f}" if pv is not None else "-")
+            sd2.append(row)
+        nc2 = len(sh2)
+        st3 = Table(sd2, colWidths=[W/nc2]*nc2, repeatRows=1)
+        st3.setStyle(tbl_style())
+        story.append(st3)
+        story.append(Spacer(1, 0.3*cm))
+        di = make_desirability_img(project.opt_solutions)
+        if di: story.append(di)
+    else:
+        story.append(Paragraph("Optimizasyon sonucu bulunamadi.", s_body))
     story.append(PageBreak())
 
-    # ════════════════════════════════════════════════════════════════
-    # BÖLÜM 6 — DESIGN SPACE
-    # ════════════════════════════════════════════════════════════════
-    story.append(Paragraph("5. Design Space  (ICH Q8)", s_h1))
-    story.append(HRFlowable(width="100%", thickness=1,
-                             color=NAVY_PDF, spaceAfter=8))
-
-    if not project.spec_limits or not project.model_results:
+    # ════════════════════════════════════════
+    # 5. DESIGN SPACE
+    # ════════════════════════════════════════
+    section("Design Space  (ICH Q8)", 5)
+    if project.spec_limits and project.model_results:
         story.append(Paragraph(
-            "Design Space hesaplaması için model ve spesifikasyon sınırları gereklidir.",
+            "Her CQA icin tanimlanan spesifikasyon sinirlari asagida verilmistir. "
+            "Tasarim uzayi haritasi icin programin Design Space sekmesini kullaniniz.",
             s_body))
+        story.append(Spacer(1, 0.3*cm))
+        dsh = ["CQA","LSL","USL","Hedef"]
+        dsd = [dsh]
+        for rk, sp in project.spec_limits.items():
+            dsd.append([
+                RESPONSE_LABELS.get(rk,rk),
+                f"{sp['lsl']:.4g}" if sp.get("lsl") is not None else "-",
+                f"{sp['usl']:.4g}" if sp.get("usl") is not None else "-",
+                sp.get("goal","-"),
+            ])
+        dst = Table(dsd, colWidths=[W*0.40,W*0.20,W*0.20,W*0.20])
+        dst.setStyle(tbl_style())
+        story.append(dst)
     else:
         story.append(Paragraph(
-            "Aşağıdaki tablo her CQA için faktör uzayının yüzde kaçının "
-            "spesifikasyon sınırları içinde kaldığını özetlemektedir.", s_body))
-        story.append(Spacer(1, 0.3*cm))
-
-        ds_data = [["CQA", "LSL", "USL", "Hedef"]]
-        for resp_key, spec in project.spec_limits.items():
-            ds_data.append([
-                RESPONSE_LABELS.get(resp_key, resp_key),
-                f"{spec['lsl']:.4g}" if spec.get("lsl") is not None else "—",
-                f"{spec['usl']:.4g}" if spec.get("usl") is not None else "—",
-                spec.get("goal","—"),
-            ])
-        ds_tbl = Table(ds_data,
-                       colWidths=[W*0.40, W*0.20, W*0.20, W*0.20])
-        ds_tbl.setStyle(base_table_style())
-        story.append(ds_tbl)
-        story.append(Spacer(1, 0.3*cm))
-        story.append(Paragraph(
-            "Not: Design Space haritasının tam görsel analizi için "
-            "programın '6. Design Space' sekmesini kullanın.", s_small))
-
+            "Design Space icin model ve spesifikasyon sinirlari gereklidir.", s_body))
     story.append(PageBreak())
 
-    # ════════════════════════════════════════════════════════════════
-    # BÖLÜM 7 — DOĞRULAMA
-    # ════════════════════════════════════════════════════════════════
-    story.append(Paragraph("6. Doğrulama", s_h1))
-    story.append(HRFlowable(width="100%", thickness=1,
-                             color=NAVY_PDF, spaceAfter=8))
-
+    # ════════════════════════════════════════
+    # 6. DOĞRULAMA
+    # ════════════════════════════════════════
+    section("Dogrulama", 6)
     if not project.validation_results:
-        story.append(Paragraph("Doğrulama henüz yapılmadı.", s_body))
+        story.append(Paragraph("Dogrulama henuz yapilmadi.", s_body))
     else:
-        n_pass  = sum(1 for v in project.validation_results.values()
-                      if v.get("passed"))
-        n_total = len(project.validation_results)
-        all_ok  = n_pass == n_total
-
-        verdict = "PASS ✓" if all_ok else f"KISMİ  {n_pass}/{n_total}"
-        story.append(Paragraph(verdict, s_pass if all_ok else s_fail))
+        n_p = sum(1 for v in project.validation_results.values() if v.get("passed"))
+        n_t = len(project.validation_results)
+        verdict = f"SONUC: {'PASS' if n_p==n_t else 'KISMI'}  ({n_p}/{n_t})"
+        story.append(Paragraph(verdict, s_verdict))
         story.append(Spacer(1, 0.3*cm))
-
-        val_data = [["Yanıt", "Tahmin", "Gerçek", "Sapma %", "Karar"]]
-        for resp_key, vres in project.validation_results.items():
-            actual  = vres.get("actual","—")
-            dev_pct = vres.get("dev_pct")
-            passed  = vres.get("passed", False)
-            # Tahmin değerini opt_solutions'dan al
+        vh = ["Yanit","Tahmin","Gercek","Sapma %","Karar"]
+        vd = [vh]
+        for rk, vr in project.validation_results.items():
             pred = None
             if project.opt_solutions:
-                pred = project.opt_solutions[0]["predictions"].get(resp_key)
-            val_data.append([
-                RESPONSE_LABELS.get(resp_key, resp_key),
-                f"{pred:.4f}" if pred is not None else "—",
+                pred = project.opt_solutions[0]["predictions"].get(rk)
+            actual  = vr.get("actual","-")
+            dev_pct = vr.get("dev_pct")
+            passed  = vr.get("passed", False)
+            vd.append([
+                RESPONSE_LABELS.get(rk,rk),
+                f"{pred:.4f}" if pred is not None else "-",
                 f"{actual:.4f}" if isinstance(actual, float) else str(actual),
-                f"{dev_pct:.2f}%" if dev_pct is not None else "—",
-                "PASS ✓" if passed else "FAIL ✗",
+                f"{dev_pct:.2f}%" if dev_pct is not None else "-",
+                "PASS" if passed else "FAIL",
             ])
-        val_tbl = Table(val_data,
-                        colWidths=[W*0.30, W*0.17, W*0.17, W*0.17, W*0.19])
-        val_style = base_table_style()
-        for ri, (resp_key, vres) in enumerate(
-                project.validation_results.items(), 1):
-            passed = vres.get("passed", False)
-            col = GREEN_PDF if passed else RED_PDF
-            val_style.add("TEXTCOLOR", (4,ri), (4,ri), col)
-            val_style.add("BACKGROUND", (0,ri), (-1,ri),
-                          colors.HexColor("#0a2a0a") if passed
-                          else colors.HexColor("#2a0a0a"))
-        val_tbl.setStyle(val_style)
-        story.append(val_tbl)
-
+        vt = Table(vd, colWidths=[W*0.30,W*0.17,W*0.17,W*0.17,W*0.19])
+        vt.setStyle(tbl_style())
+        story.append(vt)
     story.append(PageBreak())
 
-    # ════════════════════════════════════════════════════════════════
-    # BÖLÜM 8 — SONUÇ
-    # ════════════════════════════════════════════════════════════════
-    story.append(Paragraph("7. Sonuç ve Değerlendirme", s_h1))
-    story.append(HRFlowable(width="100%", thickness=1,
-                             color=NAVY_PDF, spaceAfter=8))
-
-    # Otomatik değerlendirme
+    # ════════════════════════════════════════
+    # 7. SONUÇ
+    # ════════════════════════════════════════
+    section("Sonuc ve Degerlendirme", 7)
     r2_vals = [res["r2"] for res in project.model_results.values()]
     if r2_vals:
-        avg_r2 = sum(r2_vals) / len(r2_vals)
-        if avg_r2 >= 0.9:
-            model_eval = "Model kalitesi mükemmel (ort. R² ≥ 0.90)."
-        elif avg_r2 >= 0.7:
-            model_eval = "Model kalitesi kabul edilebilir (ort. R² ≥ 0.70)."
-        else:
-            model_eval = ("Model kalitesi düşük (ort. R² < 0.70). "
-                          "Ek run veya faktör gözden geçirilmesi önerilir.")
+        avg = sum(r2_vals)/len(r2_vals)
+        me  = ("Model kalitesi mukemmel (ort. R2 >= 0.90)." if avg >= 0.9 else
+               "Model kalitesi kabul edilebilir (ort. R2 >= 0.70)." if avg >= 0.7 else
+               "Model kalitesi dusuk (ort. R2 < 0.70). Ek run onerilir.")
     else:
-        model_eval = "Model kurulmadı."
+        me = "Model kurulmadi."
 
-    opt_eval = ""
     if project.opt_solutions:
-        best_d = project.opt_solutions[0]["desirability"]
-        if best_d >= 0.8:
-            opt_eval = f"Optimizasyon başarılı (D={best_d:.4f})."
-        elif best_d >= 0.5:
-            opt_eval = (f"Optimizasyon kısmi başarı (D={best_d:.4f}). "
-                        "Spesifikasyon sınırları gözden geçirilebilir.")
-        else:
-            opt_eval = (f"Optimizasyon düşük desirability (D={best_d:.4f}). "
-                        "Model ve spesifikasyonlar yeniden değerlendirilmeli.")
+        bd = project.opt_solutions[0]["desirability"]
+        oe = (f"Optimizasyon basarili (D={bd:.4f})." if bd >= 0.8 else
+              f"Optimizasyon kismi basari (D={bd:.4f})." if bd >= 0.5 else
+              f"Optimizasyon dusuk desirability (D={bd:.4f}). Gozden geciriniz.")
     else:
-        opt_eval = "Optimizasyon yapılmadı veya çözüm bulunamadı."
+        oe = "Optimizasyon yapilmadi."
 
-    val_eval = ""
     if project.validation_results:
-        n_p = sum(1 for v in project.validation_results.values()
-                  if v.get("passed"))
-        n_t = len(project.validation_results)
-        if n_p == n_t:
-            val_eval = f"Doğrulama başarılı ({n_p}/{n_t} PASS)."
-        else:
-            val_eval = (f"Doğrulama kısmi ({n_p}/{n_t} PASS). "
-                        "Başarısız yanıtlar için ek çalışma önerilir.")
+        np_ = sum(1 for v in project.validation_results.values() if v.get("passed"))
+        nt_ = len(project.validation_results)
+        ve  = (f"Dogrulama basarili ({np_}/{nt_} PASS)." if np_==nt_ else
+               f"Dogrulama kismi ({np_}/{nt_} PASS).")
     else:
-        val_eval = "Doğrulama yapılmadı."
+        ve = "Dogrulama yapilmadi."
 
-    eval_text = (f"{model_eval}  {opt_eval}  {val_eval}")
-    story.append(Paragraph(eval_text, s_body))
-    story.append(Spacer(1, 1*cm))
-
-    # Notlar alanı
-    story.append(Paragraph("Kullanıcı Notları:", s_h2))
-    note_data = [["" for _ in range(1)] for _ in range(5)]
-    note_tbl = Table(note_data, colWidths=[W], rowHeights=[0.6*cm]*5)
-    note_tbl.setStyle(TableStyle([
-        ("GRID",       (0,0), (-1,-1), 0.5, colors.HexColor("#2a4060")),
-        ("BACKGROUND", (0,0), (-1,-1), ROW2),
-        ("TEXTCOLOR",  (0,0), (-1,-1), LIGHT),
+    story.append(Paragraph(f"{me}  {oe}  {ve}", s_body))
+    story.append(Spacer(1, 0.8*cm))
+    story.append(Paragraph("Kullanici Notlari:", s_h2))
+    note_rows = [[""] for _ in range(5)]
+    nt2 = Table(note_rows, colWidths=[W], rowHeights=[0.6*cm]*5)
+    nt2.setStyle(TableStyle([
+        ("GRID",    (0,0),(-1,-1), 0.5, LGRAY),
+        ("FONTNAME",(0,0),(-1,-1), FONT_REG),
     ]))
-    story.append(note_tbl)
+    story.append(nt2)
     story.append(Spacer(1, 0.6*cm))
-
-    # İmza alanı
-    sig_data = [
-        ["Hazırlayan:", "Tarih:", "İmza:"],
-        ["_"*30, "_"*20, "_"*30],
+    sig = [
+        ["Hazirlayan:", "Tarih:", "Imza:"],
+        ["_"*28, "_"*18, "_"*28],
     ]
-    sig_tbl = Table(sig_data, colWidths=[W*0.40, W*0.25, W*0.35])
-    sig_tbl.setStyle(TableStyle([
-        ("FONTNAME",  (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE",  (0,0), (-1,-1), 9),
-        ("TEXTCOLOR", (0,0), (-1,-1), LIGHT),
-        ("ALIGN",     (0,0), (-1,-1), "LEFT"),
-        ("TOPPADDING",(0,0), (-1,-1), 6),
+    sigt = Table(sig, colWidths=[W*0.40, W*0.25, W*0.35])
+    sigt.setStyle(TableStyle([
+        ("FONTNAME",  (0,0),(-1,0),  FONT_BOLD),
+        ("FONTNAME",  (0,1),(-1,-1), FONT_REG),
+        ("FONTSIZE",  (0,0),(-1,-1), 9),
+        ("TEXTCOLOR", (0,0),(-1,-1), BLACK),
+        ("ALIGN",     (0,0),(-1,-1), "LEFT"),
+        ("TOPPADDING",(0,0),(-1,-1), 6),
     ]))
-    story.append(sig_tbl)
+    story.append(sigt)
 
-    # ── PDF oluştur ───────────────────────────────────────────────────────────
-    doc.build(story,
-              onFirstPage=on_page,
-              onLaterPages=on_page)
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
 
 
 class PlaceholderTab(QWidget):
@@ -4959,17 +4916,29 @@ class FormulasyonOptimizerApp(QMainWindow):
         if not path:
             return
         try:
-            self.status_bar.showMessage("PDF oluşturuluyor...")
+            self.status_bar.showMessage("PDF olusturuluyor...")
             QApplication.processEvents()
             generate_pdf_report(self.project, path)
             self.status_bar.showMessage(f"PDF kaydedildi: {path}", 6000)
-            QMessageBox.information(self, "Başarılı",
-                f"PDF rapor oluşturuldu:\n{path}")
+            reply = QMessageBox.question(
+                self, "PDF Rapor Hazir",
+                f"PDF rapor basariyla olusturuldu.\n\n"
+                f"Raporu simdi goruntülemek ister misiniz?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if reply == QMessageBox.StandardButton.Yes:
+                import subprocess, platform
+                if platform.system() == "Windows":
+                    os.startfile(path)
+                elif platform.system() == "Darwin":
+                    subprocess.run(["open", path])
+                else:
+                    subprocess.run(["xdg-open", path])
         except Exception as e:
             import traceback
             write_log(f"PDF hata:\n{traceback.format_exc()}")
             QMessageBox.critical(self, "Hata",
-                f"PDF oluşturulamadı:\n{e}")
+                f"PDF olusturulamadi:\n{e}")
 
     def _new_project(self):
         reply = QMessageBox.question(
