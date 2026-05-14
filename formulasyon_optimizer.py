@@ -529,34 +529,30 @@ class FactorRow(QWidget):
         self.unit_edit.setPlaceholderText("Birim")
         lay.addWidget(self.unit_edit)
 
-        # Düşük
-        lbl_lo = QLabel("Alt:")
-        lbl_lo.setStyleSheet(f"color:{TXT2}; font-size:11px; background:transparent;")
-        lbl_lo.setFixedWidth(26)
-        lay.addWidget(lbl_lo)
+        # Düşük — etiket yok, başlıkta yazıyor
         self.low_sp = QDoubleSpinBox()
         self.low_sp.setRange(-1e9, 1e9); self.low_sp.setValue(0); self.low_sp.setDecimals(4)
-        self.low_sp.setFixedWidth(90)
+        self.low_sp.setFixedWidth(100)
         lay.addWidget(self.low_sp)
 
-        # Orta
-        self.lbl_mid = QLabel("Orta:")
-        self.lbl_mid.setStyleSheet(f"color:{TXT2}; font-size:11px; background:transparent;")
-        self.lbl_mid.setFixedWidth(36)
+        lay.addSpacing(6)
+
+        # Orta — etiket yok, başlıkta yazıyor
+        self.lbl_mid = QLabel("")   # gizli yer tutucu (genişlik için)
+        self.lbl_mid.setFixedWidth(0)
+        self.lbl_mid.setVisible(False)
         lay.addWidget(self.lbl_mid)
         self.mid_sp = QDoubleSpinBox()
         self.mid_sp.setRange(-1e9, 1e9); self.mid_sp.setValue(0.5); self.mid_sp.setDecimals(4)
-        self.mid_sp.setFixedWidth(90)
+        self.mid_sp.setFixedWidth(100)
         lay.addWidget(self.mid_sp)
 
-        # Yüksek
-        lbl_hi = QLabel("Üst:")
-        lbl_hi.setStyleSheet(f"color:{TXT2}; font-size:11px; background:transparent;")
-        lbl_hi.setFixedWidth(30)
-        lay.addWidget(lbl_hi)
+        lay.addSpacing(6)
+
+        # Üst — etiket yok, başlıkta yazıyor
         self.high_sp = QDoubleSpinBox()
         self.high_sp.setRange(-1e9, 1e9); self.high_sp.setValue(1); self.high_sp.setDecimals(4)
-        self.high_sp.setFixedWidth(90)
+        self.high_sp.setFixedWidth(100)
         lay.addWidget(self.high_sp)
 
         lay.addStretch()
@@ -633,13 +629,20 @@ class Tab1_Design(QWidget):
         # Sütun başlıkları
         hdr_w = QWidget(); hdr_w.setStyleSheet("background:transparent;")
         hdr_l = QHBoxLayout(hdr_w)
-        hdr_l.setContentsMargins(28, 0, 32, 0); hdr_l.setSpacing(6)
-        for txt, w in [("İsim", 140), ("Birim", 70), ("", 26),
-                       ("Alt Seviye", 90), ("_MID_HDR_", 36), ("Orta Seviye", 90),
-                       ("", 30), ("Üst Seviye", 90)]:
-            l = QLabel("" if txt == "_MID_HDR_" else txt)
+        hdr_l.setContentsMargins(28, 0, 32, 0); hdr_l.setSpacing(12)
+        # Başlık sütunları — FactorRow genişlikleriyle eşleşir
+        _hdr_items = [
+            ("İsim",        140),
+            ("Birim",        70),
+            ("Alt Seviye",  100),
+            ("Orta Seviye", 100),
+            ("Üst Seviye",  100),
+        ]
+        for txt, w in _hdr_items:
+            l = QLabel(txt)
             l.setFixedWidth(w)
-            l.setStyleSheet(f"color:{GOLD}; font-size:10px; font-weight:bold; background:transparent;")
+            l.setStyleSheet(
+                f"color:{GOLD}; font-size:10px; font-weight:bold; background:transparent;")
             hdr_l.addWidget(l)
             if txt == "Orta Seviye":
                 self._mid_hdr_lbl = l
@@ -4155,7 +4158,7 @@ def generate_pdf_report(project, output_path):
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        PageBreak, Image, HRFlowable
+        PageBreak, Image, HRFlowable, KeepTogether
     )
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
     from reportlab.pdfbase import pdfmetrics
@@ -4405,9 +4408,23 @@ def generate_pdf_report(project, output_path):
                           color=BLACK, spaceAfter=8)
 
     def section(title, num):
-        story.append(Spacer(1, 0.2*cm))
-        story.append(Paragraph(f"{num}. {title}", s_h1))
-        story.append(hr())
+        # Başlık bir sonraki sayfaya geçmesin — KeepTogether ile başlığı
+        # içeriğin ilk elemanıyla birlikte tut
+        story.append(KeepTogether([
+            Spacer(1, 0.2*cm),
+            Paragraph(f"{num}. {title}", s_h1),
+            hr(),
+        ]))
+
+    def subsection_block(title, content_elements):
+        """Alt başlık + içeriği aynı sayfada tut."""
+        block = [Paragraph(title, s_h2)] + content_elements
+        try:
+            story.append(KeepTogether(block))
+        except Exception:
+            # KeepTogether çok büyük içerikte başarısız olursa düz ekle
+            for el in block:
+                story.append(el)
 
     # ════════════════════════════════════════
     # KAPAK
@@ -4443,7 +4460,6 @@ def generate_pdf_report(project, output_path):
     # ════════════════════════════════════════
     section("Deney Tasarimi", 1)
 
-    story.append(Paragraph("1.1 Faktorler", s_h2))
     fh = ["Faktor", "Birim", "Alt", "Orta", "Ust"]
     fd = [fh] + [
         [f["name"], f.get("unit","-"),
@@ -4454,8 +4470,9 @@ def generate_pdf_report(project, output_path):
     ]
     ft = Table(fd, colWidths=[W*0.30,W*0.12,W*0.19,W*0.19,W*0.20])
     ft.setStyle(tbl_style())
-    story.append(ft)
-    story.append(Spacer(1, 0.4*cm))
+    story.append(KeepTogether([
+        Paragraph("1.1 Faktorler", s_h2), ft, Spacer(1, 0.4*cm)
+    ]))
 
     if dm is not None:
         story.append(Paragraph("1.2 Deney Matrisi", s_h2))
@@ -4486,7 +4503,8 @@ def generate_pdf_report(project, output_path):
     if not project.model_results:
         story.append(Paragraph("Model henuz kurulmadi.", s_body))
     else:
-        story.append(Paragraph("2.1 Model Istatistikleri", s_h2))
+        story.append(KeepTogether([Paragraph("2.1 Model Istatistikleri", s_h2)]))
+        story.append(Paragraph("", s_body))
         sh = ["Yanit","R2","Adj R2","RMSE","F p","SW p","n"]
         sd = [sh]
         for rk in project.responses:
@@ -4582,7 +4600,7 @@ def generate_pdf_report(project, output_path):
     # ════════════════════════════════════════
     section("Optimizasyon Sonuclari", 4)
     if project.spec_limits:
-        story.append(Paragraph("4.1 Spesifikasyon Sinirlari", s_h2))
+        story.append(KeepTogether([Paragraph("4.1 Spesifikasyon Sinirlari", s_h2)]))
         sph = ["Yanit","Hedef","LSL","USL","Hedef Deger","Agirlik s"]
         spd = [sph]
         for rk, sp in project.spec_limits.items():
@@ -4833,14 +4851,21 @@ class FormulasyonOptimizerApp(QMainWindow):
         hdr_lay.addStretch()
 
         # Sağ: versiyon + yeni proje butonu
-        ver_lbl = QLabel("v1.0  |  Ph.Eur 2.9.18 / USP <601>")
-        ver_lbl.setStyleSheet(f"color: #3a5070; font-size: 10px; background: transparent;")
+        ver_lbl = QLabel(
+            "v1.0  |  Ph.Eur 2.9.18 / USP <601>  "
+            "|  Designed by Barbaros Çelik")
+        ver_lbl.setStyleSheet(
+            f"color: #3a5070; font-size: 10px; background: transparent;")
         hdr_lay.addWidget(ver_lbl)
 
         hdr_lay.addSpacing(16)
         btn_pdf = make_btn("📄  PDF Rapor", "rgba(20,80,20,0.5)", 30)
         btn_pdf.clicked.connect(self._export_pdf)
         hdr_lay.addWidget(btn_pdf)
+
+        btn_tmpl = make_btn("📋  Excel Şablonu", "rgba(20,60,100,0.5)", 30)
+        btn_tmpl.clicked.connect(self._export_excel_template)
+        hdr_lay.addWidget(btn_tmpl)
 
         hdr_lay.addSpacing(8)
         btn_new = make_btn("🗋  Yeni Proje", "rgba(160,100,0,0.4)", 30)
@@ -4902,6 +4927,197 @@ class FormulasyonOptimizerApp(QMainWindow):
         self.status_bar.showMessage(
             f"Proje hazır — {n} run, {k} faktör, {len(self.project.responses)} yanıt  "
             f"|  Sonraki: Veri Girişi sekmesi", 8000)
+
+    def _export_excel_template(self):
+        """Veri girişi için Excel şablonu oluştur."""
+        if self.project.design_matrix is None:
+            QMessageBox.warning(self, "",
+                "Önce Deney Tasarımı sekmesinden matris oluşturun.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Excel Şablonu Kaydet",
+            f"VeriGirisi_Sablonu_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx",
+            "Excel (*.xlsx)")
+        if not path:
+            return
+        try:
+            import openpyxl
+            from openpyxl.styles import (
+                PatternFill, Font, Alignment, Border, Side, Protection)
+            from openpyxl.utils import get_column_letter
+
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Veri Girisi"
+
+            # Renkler
+            navy_fill  = PatternFill("solid", fgColor="002D62")
+            gold_fill  = PatternFill("solid", fgColor="FFC600")
+            green_fill = PatternFill("solid", fgColor="E2EFDA")
+            gray_fill  = PatternFill("solid", fgColor="D9D9D9")
+            blue_fill  = PatternFill("solid", fgColor="DDEEFF")
+            white_fill = PatternFill("solid", fgColor="FFFFFF")
+
+            thin = Side(style="thin", color="AAAAAA")
+            border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            def hdr_cell(ws, row, col, text, fill=navy_fill, font_color="FFFFFF",
+                         bold=True, align="center"):
+                c = ws.cell(row=row, column=col, value=text)
+                c.fill = fill
+                c.font = Font(bold=bold, color=font_color, size=10)
+                c.alignment = Alignment(horizontal=align, vertical="center",
+                                        wrap_text=True)
+                c.border = border
+                return c
+
+            def data_cell(ws, row, col, value="", fill=white_fill, locked=False):
+                c = ws.cell(row=row, column=col, value=value)
+                c.fill = fill
+                c.font = Font(size=9)
+                c.alignment = Alignment(horizontal="center", vertical="center")
+                c.border = border
+                return c
+
+            # ── Başlık ──────────────────────────────────────────────────────
+            ws.merge_cells("A1:Z1")
+            title_cell = ws["A1"]
+            title_cell.value = "Formulasyon-Optimizer — Veri Giriş Şablonu"
+            title_cell.fill = navy_fill
+            title_cell.font = Font(bold=True, color="FFC600", size=13)
+            title_cell.alignment = Alignment(horizontal="center", vertical="center")
+            ws.row_dimensions[1].height = 28
+
+            # ── Bilgi satırı ─────────────────────────────────────────────────
+            ws.merge_cells("A2:Z2")
+            info_cell = ws["A2"]
+            info_cell.value = (
+                "KULLANIM: Mavi sütunlar = faktör değerleri (değiştirmeyin).  "
+                "Yeşil sütunlar = NGI ölçüm sonuçları (bu sütunlara girin).  "
+                "Doldurunca Veri Girişi sekmesinde 'Excel'den İçe Aktar' butonunu kullanın.")
+            info_cell.fill = gold_fill
+            info_cell.font = Font(bold=False, color="000000", size=9)
+            info_cell.alignment = Alignment(horizontal="left", vertical="center",
+                                            wrap_text=True)
+            ws.row_dimensions[2].height = 30
+
+            # ── Sütun başlıkları ─────────────────────────────────────────────
+            dm = self.project.design_matrix
+            factors = self.project.factors
+            responses = self.project.responses
+
+            col = 1
+            # Run No
+            hdr_cell(ws, 3, col, "Run No", fill=navy_fill)
+            ws.column_dimensions[get_column_letter(col)].width = 8
+            col += 1
+
+            # Faktör sütunları — mavi
+            for f in factors:
+                unit = f.get("unit","")
+                hdr_txt = (f["name"] + f" ({unit})" if unit else f["name"])
+                hdr_cell(ws, 3, col, hdr_txt, fill=PatternFill("solid", fgColor="1F4E79"),
+                         font_color="FFFFFF")
+                ws.column_dimensions[get_column_letter(col)].width = 14
+                col += 1
+
+            # Yanıt sütunları — yeşil başlık
+            for resp in responses:
+                label = RESPONSE_LABELS.get(resp, resp)
+                hdr_cell(ws, 3, col, label,
+                         fill=PatternFill("solid", fgColor="375623"),
+                         font_color="FFFFFF")
+                ws.column_dimensions[get_column_letter(col)].width = 16
+                col += 1
+
+            ws.row_dimensions[3].height = 36
+
+            # ── Veri satırları ───────────────────────────────────────────────
+            for ri in range(len(dm)):
+                row = ri + 4
+                col = 1
+
+                # Run No
+                data_cell(ws, row, col, ri + 1,
+                          fill=PatternFill("solid", fgColor="1F4E79"))
+                ws.cell(row=row, column=col).font = Font(
+                    bold=True, color="FFFFFF", size=9)
+                col += 1
+
+                # Faktör değerleri — salt okunur görünüm
+                for f in factors:
+                    val = dm.iloc[ri][f["name"]]
+                    c = data_cell(ws, row, col,
+                                  round(float(val), 6), fill=blue_fill)
+                    col += 1
+
+                # Yanıt sütunları — boş, girilecek
+                for _ in responses:
+                    data_cell(ws, row, col, "", fill=green_fill)
+                    col += 1
+
+                ws.row_dimensions[row].height = 18
+
+            # ── Açıklama sayfası ─────────────────────────────────────────────
+            ws2 = wb.create_sheet("Aciklama")
+            ws2.column_dimensions["A"].width = 25
+            ws2.column_dimensions["B"].width = 60
+
+            info_rows = [
+                ("ŞABLON KULLANIM KILAVUZU", ""),
+                ("", ""),
+                ("Adım 1", "Bu şablonu indirin ve NGI deneylerini yapın."),
+                ("Adım 2", "Yeşil sütunlara her run için NGI ölçüm sonuçlarını girin."),
+                ("Adım 3", "Mavi faktör sütunlarını KESİNLİKLE değiştirmeyin."),
+                ("Adım 4", "Programda 'Veri Girişi' sekmesine gidin."),
+                ("Adım 5", "'Excel'den İçe Aktar' butonuna tıklayın ve bu dosyayı seçin."),
+                ("Adım 6", "Veriler otomatik olarak yüklenecektir."),
+                ("", ""),
+                ("ÖNEMLİ NOTLAR", ""),
+                ("Run sırası", "Satır sırasını değiştirmeyin — Run No kolonu referanstır."),
+                ("Ondalık ayracı", "Virgül veya nokta kullanabilirsiniz, program her ikisini de okur."),
+                ("Boş değerler", "Yapılamayan run'ları boş bırakabilirsiniz."),
+                ("", ""),
+                ("YANIT DEĞİŞKENLERİ", ""),
+            ]
+
+            for ri2, (rk, rl) in enumerate(RESPONSE_LABELS.items()):
+                info_rows.append((rl, rk))
+
+            for ri3, (label, value) in enumerate(info_rows, 1):
+                c1 = ws2.cell(row=ri3, column=1, value=label)
+                c2 = ws2.cell(row=ri3, column=2, value=value)
+                if label in ("ŞABLON KULLANIM KILAVUZU", "ÖNEMLİ NOTLAR",
+                             "YANIT DEĞİŞKENLERİ"):
+                    c1.font = Font(bold=True, size=11, color="002D62")
+                else:
+                    c1.font = Font(bold=True, size=9)
+                    c2.font = Font(size=9)
+                c1.alignment = Alignment(vertical="center")
+                c2.alignment = Alignment(vertical="center", wrap_text=True)
+                ws2.row_dimensions[ri3].height = 16
+
+            # ── Kaydet ───────────────────────────────────────────────────────
+            wb.save(path)
+            reply = QMessageBox.question(
+                self, "Excel Şablonu Hazır",
+                f"Excel şablonu oluşturuldu.\n\n"
+                f"Şablonu şimdi açmak ister misiniz?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if reply == QMessageBox.StandardButton.Yes:
+                import subprocess, platform
+                if platform.system() == "Windows":
+                    os.startfile(path)
+                elif platform.system() == "Darwin":
+                    subprocess.run(["open", path])
+                else:
+                    subprocess.run(["xdg-open", path])
+            self.status_bar.showMessage(f"Excel şablonu kaydedildi: {path}", 5000)
+        except Exception as e:
+            import traceback
+            write_log(f"Excel sablon hatasi:\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "Hata", f"Excel şablonu oluşturulamadı:\n{e}")
 
     def _export_pdf(self):
         """PDF rapor oluştur ve kaydet."""
