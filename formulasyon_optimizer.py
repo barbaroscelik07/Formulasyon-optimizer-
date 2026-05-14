@@ -1780,7 +1780,359 @@ class Tab3_Model(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PLACEHOLDER SEKMELER (Adım 4-7 için)
+# SEKME 4 — RESPONSE SURFACE
+# ═══════════════════════════════════════════════════════════════════════════════
+class Tab4_ResponseSurface(QWidget):
+    """3D yüzey + kontur haritası + sabit faktör slider'ları."""
+
+    def __init__(self, project: OptimizerProject, app_ref, parent=None):
+        super().__init__(parent)
+        self.project = project
+        self.app     = app_ref
+        self._build()
+
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+
+        # ── Kontrol çubuğu ────────────────────────────────────────────────────
+        ctrl = card_frame()
+        cl = QHBoxLayout(ctrl)
+        cl.setContentsMargins(14, 8, 14, 8)
+        cl.setSpacing(16)
+
+        cl.addWidget(QLabel("Yanıt:"))
+        self.resp_combo = QComboBox(); self.resp_combo.setFixedHeight(28)
+        cl.addWidget(self.resp_combo)
+
+        cl.addWidget(QLabel("X Ekseni:"))
+        self.x_combo = QComboBox(); self.x_combo.setFixedHeight(28)
+        cl.addWidget(self.x_combo)
+
+        cl.addWidget(QLabel("Y Ekseni:"))
+        self.y_combo = QComboBox(); self.y_combo.setFixedHeight(28)
+        cl.addWidget(self.y_combo)
+
+        cl.addWidget(QLabel("Çözünürlük:"))
+        self.res_spin = QSpinBox()
+        self.res_spin.setRange(20, 100); self.res_spin.setValue(40)
+        self.res_spin.setFixedWidth(60); self.res_spin.setFixedHeight(28)
+        cl.addWidget(self.res_spin)
+
+        cl.addStretch()
+
+        self.btn_plot = make_btn("▶  Grafik Çiz", "rgba(20,80,20,0.9)", 32)
+        self.btn_plot.setStyleSheet(self.btn_plot.styleSheet() +
+                                    "font-size:12px; font-weight:bold;")
+        self.btn_plot.clicked.connect(self._plot)
+        cl.addWidget(self.btn_plot)
+
+        outer.addWidget(ctrl)
+
+        # ── Sabit faktör slider'ları ───────────────────────────────────────────
+        self.slider_card = card_frame()
+        self.slider_layout = QHBoxLayout(self.slider_card)
+        self.slider_layout.setContentsMargins(14, 8, 14, 8)
+        self.slider_layout.setSpacing(20)
+        self.slider_card.setFixedHeight(70)
+        self._slider_widgets = {}   # {factor_name: (label, spinbox)}
+        outer.addWidget(self.slider_card)
+
+        # ── Ana grafik alanı ─────────────────────────────────────────────────
+        self.fig = Figure(figsize=(13, 5), facecolor=BG2)
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setStyleSheet(f"background: {BG2};")
+        outer.addWidget(self.canvas, 1)
+
+        # ── Alt çubuk ────────────────────────────────────────────────────────
+        bot = QHBoxLayout()
+        self.status_lbl = QLabel("Model kurulduktan sonra grafik çizebilirsiniz.")
+        self.status_lbl.setStyleSheet(
+            f"color:{TXT2}; font-size:11px; background:transparent;")
+        bot.addWidget(self.status_lbl)
+        bot.addStretch()
+        self.btn_next = make_btn("Optimizasyon  ▶", "rgba(20,80,20,0.8)", 34)
+        self.btn_next.setStyleSheet(self.btn_next.styleSheet() +
+                                    "font-size:12px; font-weight:bold;")
+        self.btn_next.clicked.connect(lambda: self.app.tabs.setCurrentIndex(4))
+        bot.addWidget(self.btn_next)
+        outer.addLayout(bot)
+
+        # Sinyal bağlantıları
+        self.resp_combo.currentTextChanged.connect(self._on_selection_changed)
+        self.x_combo.currentTextChanged.connect(self._on_selection_changed)
+        self.y_combo.currentTextChanged.connect(self._on_selection_changed)
+
+    # ── Public ───────────────────────────────────────────────────────────────
+    def refresh(self):
+        if not self.project.model_results:
+            return
+        self._populate_combos()
+
+    # ── İç metodlar ──────────────────────────────────────────────────────────
+    def _populate_combos(self):
+        """Combo kutularını model sonuçlarına göre doldur."""
+        self.resp_combo.blockSignals(True)
+        self.x_combo.blockSignals(True)
+        self.y_combo.blockSignals(True)
+
+        self.resp_combo.clear()
+        for r in self.project.responses:
+            if r in self.project.model_results:
+                self.resp_combo.addItem(RESPONSE_LABELS.get(r, r), r)
+
+        self.x_combo.clear()
+        self.y_combo.clear()
+        safe = self.project.get_safe_names()
+        factors = self.project.factors
+        for i, f in enumerate(factors):
+            label = f"{f['name']}" + (f" ({f['unit']})" if f.get("unit") else "")
+            self.x_combo.addItem(label, i)
+            self.y_combo.addItem(label, i)
+
+        # Varsayılan: X=0, Y=1
+        if self.x_combo.count() >= 2:
+            self.y_combo.setCurrentIndex(1)
+
+        self.resp_combo.blockSignals(False)
+        self.x_combo.blockSignals(False)
+        self.y_combo.blockSignals(False)
+
+        self._build_sliders()
+
+    def _build_sliders(self):
+        """Sabit faktörler için slider (SpinBox) oluştur."""
+        # Mevcut widget'ları temizle
+        while self.slider_layout.count():
+            item = self.slider_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._slider_widgets = {}
+
+        xi = self.x_combo.currentData() or 0
+        yi = self.y_combo.currentData() or 1
+
+        for i, f in enumerate(self.project.factors):
+            if i in (xi, yi):
+                continue
+            mid = f.get("mid", (f["low"] + f["high"]) / 2)
+            grp = QGroupBox(f"{f['name']}")
+            grp.setFixedWidth(150)
+            gl = QVBoxLayout(grp)
+            gl.setContentsMargins(6, 4, 6, 4)
+            sp = QDoubleSpinBox()
+            sp.setRange(f["low"], f["high"])
+            sp.setValue(mid)
+            sp.setDecimals(3)
+            sp.setSingleStep((f["high"] - f["low"]) / 20)
+            sp.setFixedHeight(26)
+            if f.get("unit"):
+                sp.setSuffix(f"  {f['unit']}")
+            gl.addWidget(sp)
+            self.slider_layout.addWidget(grp)
+            self._slider_widgets[i] = sp
+
+        self.slider_layout.addStretch()
+
+    def _on_selection_changed(self, _=None):
+        self._build_sliders()
+
+    def _get_fixed_values(self):
+        """Sabit faktörlerin şu anki değerlerini döner: {factor_idx: value}"""
+        return {i: sp.value() for i, sp in self._slider_widgets.items()}
+
+    def _predict_grid(self, resp_key, xi, yi, n):
+        """X-Y ızgara üzerinde tahmin yüzeyi hesapla."""
+        res   = self.project.model_results[resp_key]
+        model = res["model"]
+        safe  = self.project.get_safe_names()
+        factors = self.project.factors
+
+        fx = factors[xi]; fy = factors[yi]
+        x_real = np.linspace(fx["low"], fx["high"], n)
+        y_real = np.linspace(fy["low"], fy["high"], n)
+        XX, YY = np.meshgrid(x_real, y_real)
+
+        fixed = self._get_fixed_values()
+
+        # Kodlanmış değerlere çevir
+        def encode(val, f):
+            lo, hi = f["low"], f["high"]
+            mid = f.get("mid", (lo + hi) / 2)
+            if hi == lo: return 0.0
+            if val <= mid and (mid - lo) != 0:
+                return (val - lo) / (mid - lo) - 1
+            elif (hi - mid) != 0:
+                return (val - mid) / (hi - mid)
+            return 0.0
+
+        ZZ = np.zeros_like(XX)
+        n_factors = len(factors)
+
+        for r in range(n):
+            for c in range(n):
+                row_vals = {}
+                for k, f in enumerate(factors):
+                    if k == xi:
+                        row_vals[safe[k]] = encode(XX[r, c], f)
+                    elif k == yi:
+                        row_vals[safe[k]] = encode(YY[r, c], f)
+                    else:
+                        row_vals[safe[k]] = encode(fixed.get(k, f.get("mid",
+                            (f["low"]+f["high"])/2)), f)
+
+                # Karesel ve etkileşim terimleri
+                for name in safe:
+                    row_vals[f"{name}_sq"] = row_vals[name] ** 2
+                for a in range(n_factors):
+                    for b in range(a+1, n_factors):
+                        col = f"{safe[a]}_x_{safe[b]}"
+                        row_vals[col] = row_vals[safe[a]] * row_vals[safe[b]]
+
+                # pandas zaten yuklu
+                row_df = pd.DataFrame([row_vals])
+                import statsmodels.api as sm
+                row_mat = sm.add_constant(row_df, has_constant="add")
+                # Modelin beklediği sütunlarla hizala
+                for col in model.params.index:
+                    if col not in row_mat.columns:
+                        row_mat[col] = 0
+                row_mat = row_mat[model.params.index]
+                try:
+                    ZZ[r, c] = model.predict(row_mat)[0]
+                except Exception:
+                    ZZ[r, c] = np.nan
+
+        return XX, YY, ZZ, x_real, y_real
+
+    def _plot(self):
+        if not self.project.model_results:
+            QMessageBox.warning(self, "", "Önce Model sekmesinden model kurun.")
+            return
+
+        resp_key = self.resp_combo.currentData()
+        xi = self.x_combo.currentData()
+        yi = self.y_combo.currentData()
+
+        if resp_key is None or xi is None or yi is None:
+            return
+        if xi == yi:
+            QMessageBox.warning(self, "", "X ve Y ekseni farklı faktörler olmalıdır.")
+            return
+        if resp_key not in self.project.model_results:
+            QMessageBox.warning(self, "", "Bu yanıt için model bulunamadı.")
+            return
+
+        self.btn_plot.setEnabled(False)
+        self.btn_plot.setText("⏳ Hesaplanıyor...")
+        self.app.status_bar.showMessage("Yüzey hesaplanıyor...")
+        QApplication.processEvents()
+
+        try:
+            n   = self.res_spin.value()
+            XX, YY, ZZ, x_real, y_real = self._predict_grid(resp_key, xi, yi, n)
+            self._draw(resp_key, xi, yi, XX, YY, ZZ)
+            self.status_lbl.setText(
+                f"✅  {RESPONSE_LABELS.get(resp_key,resp_key)}  |  "
+                f"X: {self.project.factors[xi]['name']}  |  "
+                f"Y: {self.project.factors[yi]['name']}")
+            self.app.status_bar.showMessage("Grafik hazır.", 3000)
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Grafik çizilemedi:\n{e}")
+        finally:
+            self.btn_plot.setEnabled(True)
+            self.btn_plot.setText("▶  Grafik Çiz")
+
+    def _draw(self, resp_key, xi, yi, XX, YY, ZZ):
+        from mpl_toolkits.mplot3d import Axes3D
+        import matplotlib.cm as cm
+
+        factors = self.project.factors
+        fx = factors[xi]; fy = factors[yi]
+        resp_label = RESPONSE_LABELS.get(resp_key, resp_key)
+
+        self.fig.clear()
+        self.fig.patch.set_facecolor(BG2)
+
+        # Sol: 3D yüzey
+        ax3d = self.fig.add_subplot(1, 2, 1, projection='3d')
+        ax3d.set_facecolor(BG3)
+        ax3d.tick_params(colors=TXT2, labelsize=7)
+        ax3d.xaxis.pane.fill = False; ax3d.yaxis.pane.fill = False
+        ax3d.zaxis.pane.fill = False
+        ax3d.xaxis.pane.set_edgecolor("#2a4060")
+        ax3d.yaxis.pane.set_edgecolor("#2a4060")
+        ax3d.zaxis.pane.set_edgecolor("#2a4060")
+
+        surf = ax3d.plot_surface(XX, YY, ZZ,
+                                  cmap="viridis", alpha=0.85,
+                                  linewidth=0, antialiased=True)
+        ax3d.set_xlabel(f"{fx['name']}" + (f"\n({fx['unit']})" if fx.get("unit") else ""),
+                        color=TXT2, fontsize=8, labelpad=8)
+        ax3d.set_ylabel(f"{fy['name']}" + (f"\n({fy['unit']})" if fy.get("unit") else ""),
+                        color=TXT2, fontsize=8, labelpad=8)
+        ax3d.set_zlabel(resp_label, color=TXT2, fontsize=8, labelpad=8)
+        ax3d.set_title("3D Yüzey", color=GOLD, fontsize=10, pad=10)
+
+        cb3d = self.fig.colorbar(surf, ax=ax3d, shrink=0.5, pad=0.1)
+        cb3d.ax.tick_params(colors=TXT2, labelsize=7)
+
+        # Sağ: kontur haritası
+        ax2d = self.fig.add_subplot(1, 2, 2)
+        ax2d.set_facecolor(BG3)
+        ax2d.tick_params(colors=TXT2, labelsize=8)
+        for spine in ax2d.spines.values():
+            spine.set_edgecolor("#2a4060")
+
+        levels = 20
+        cf = ax2d.contourf(XX, YY, ZZ, levels=levels, cmap="viridis", alpha=0.9)
+        cs = ax2d.contour(XX, YY, ZZ, levels=levels, colors="white",
+                           alpha=0.25, linewidths=0.5)
+        ax2d.clabel(cs, inline=True, fontsize=6, colors="white", fmt="%.2f")
+
+        cb2d = self.fig.colorbar(cf, ax=ax2d)
+        cb2d.ax.tick_params(colors=TXT2, labelsize=7)
+        cb2d.set_label(resp_label, color=TXT2, fontsize=8)
+
+        # Optimum noktayı işaretle
+        if self.project.opt_solutions:
+            best = self.project.opt_solutions[0]
+            ox = best.get("factors", {}).get(self.project.factors[xi]["name"])
+            oy = best.get("factors", {}).get(self.project.factors[yi]["name"])
+            if ox is not None and oy is not None:
+                ax2d.plot(ox, oy, "*", color=GOLD, markersize=14,
+                          zorder=5, label="Optimum")
+                ax2d.legend(fontsize=8, labelcolor=TXT2,
+                             facecolor=BG2, edgecolor="#2a4060")
+
+        # Gerçek ölçüm noktaları
+        res = self.project.model_results.get(resp_key, {})
+        y_data = res.get("y")
+        if y_data is not None and self.project.design_matrix is not None:
+            df = self.project.design_matrix
+            xs_real, ys_real = [], []
+            for ri in range(len(df)):
+                if self.project.run_results.get(ri, {}).get(resp_key) is not None:
+                    xs_real.append(df.iloc[ri][fx["name"]])
+                    ys_real.append(df.iloc[ri][fy["name"]])
+            if xs_real:
+                ax2d.scatter(xs_real, ys_real, c="white", s=30,
+                             zorder=4, edgecolors="#2a4060", linewidths=0.5,
+                             alpha=0.8, label="Ölçüm")
+
+        ax2d.set_xlabel(f"{fx['name']}" + (f" ({fx['unit']})" if fx.get("unit") else ""),
+                        color=TXT2, fontsize=9)
+        ax2d.set_ylabel(f"{fy['name']}" + (f" ({fy['unit']})" if fy.get("unit") else ""),
+                        color=TXT2, fontsize=9)
+        ax2d.set_title("Kontur Haritası", color=GOLD, fontsize=10)
+
+        self.fig.tight_layout(pad=2.0)
+        self.canvas.draw()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PLACEHOLDER SEKMELER (Adım 5-7 için)
 # ═══════════════════════════════════════════════════════════════════════════════
 class PlaceholderTab(QWidget):
     """Henüz geliştirilmemiş sekmeler için yer tutucu."""
@@ -1903,11 +2255,7 @@ class FormulasyonOptimizerApp(QMainWindow):
         self.tabs.addTab(self.tab3, "3 · Model")
 
         # Sekme 4 — Response Surface
-        self.tab4 = PlaceholderTab(
-            "Response Surface",
-            "Model kurulduktan sonra 3D yüzey ve kontur haritaları\n"
-            "bu sekmede interaktif olarak incelenebilecek.",
-            "🗺")
+        self.tab4 = Tab4_ResponseSurface(self.project, self)
         self.tabs.addTab(self.tab4, "4 · Response Surface")
 
         # Sekme 5 — Optimizasyon
