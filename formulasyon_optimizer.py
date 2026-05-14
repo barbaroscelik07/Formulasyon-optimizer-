@@ -3326,6 +3326,508 @@ class Tab6_DesignSpace(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SEKME 7 — DOĞRULAMA
+# ═══════════════════════════════════════════════════════════════════════════════
+class Tab7_Validation(QWidget):
+    """Optimum formülasyon tahmin vs gerçek NGI karşılaştırması."""
+
+    def __init__(self, project: OptimizerProject, app_ref, parent=None):
+        super().__init__(parent)
+        self.project = project
+        self.app     = app_ref
+        self._build()
+
+    def _build(self):
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(12)
+
+        # ── Sol: Giriş paneli ─────────────────────────────────────────────────
+        left = QVBoxLayout()
+        left.setSpacing(10)
+
+        # Optimum seçimi
+        opt_card = card_frame()
+        ol = QVBoxLayout(opt_card)
+        ol.setContentsMargins(14, 10, 14, 10)
+        ol.setSpacing(8)
+        ol.addWidget(section_label("🏆  Doğrulanacak Formülasyon"))
+
+        opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("Formülasyon:"))
+        self.opt_combo = QComboBox(); self.opt_combo.setFixedHeight(28)
+        self.opt_combo.currentIndexChanged.connect(self._on_opt_changed)
+        opt_row.addWidget(self.opt_combo, 1)
+        ol.addLayout(opt_row)
+
+        # Seçili formülasyonun faktör değerleri
+        self.factor_lbl = QLabel("")
+        self.factor_lbl.setStyleSheet(
+            f"color:{TXT2}; font-size:11px; background:transparent;")
+        self.factor_lbl.setWordWrap(True)
+        ol.addWidget(self.factor_lbl)
+        left.addWidget(opt_card)
+
+        # Kabul kriteri
+        crit_card = card_frame()
+        cr = QHBoxLayout(crit_card)
+        cr.setContentsMargins(14, 8, 14, 8)
+        cr.setSpacing(16)
+        cr.addWidget(QLabel("Kabul Kriteri (±%):"))
+        self.crit_spin = QDoubleSpinBox()
+        self.crit_spin.setRange(1.0, 30.0); self.crit_spin.setValue(15.0)
+        self.crit_spin.setDecimals(1); self.crit_spin.setSingleStep(1.0)
+        self.crit_spin.setFixedWidth(80); self.crit_spin.setFixedHeight(28)
+        cr.addWidget(self.crit_spin)
+        cr.addWidget(info_label("Tahmin ±% aralığında gerçek değer varsa PASS"))
+        cr.addStretch()
+        left.addWidget(crit_card)
+
+        # Gerçek ölçüm girişi
+        meas_card = card_frame()
+        ml = QVBoxLayout(meas_card)
+        ml.setContentsMargins(14, 10, 14, 10)
+        ml.setSpacing(8)
+
+        mhdr = QHBoxLayout()
+        mhdr.addWidget(section_label("🔬  Gerçek NGI Ölçüm Sonuçları"))
+        mhdr.addWidget(make_help_btn(
+            "Optimum formülasyonu fiziksel olarak hazırlayıp NGI ölçümü yaptıktan sonra\n"
+            "gerçek sonuçları buraya girin.\n\n"
+            "Program tahmin ile gerçeği karşılaştırır ve model doğruluğunu raporlar.", self))
+        mhdr.addStretch()
+        ml.addLayout(mhdr)
+
+        # Yanıt giriş tablosu
+        self.meas_table = QTableWidget()
+        self.meas_table.setColumnCount(4)
+        self.meas_table.setHorizontalHeaderLabels(
+            ["Yanıt", "Tahmin", "Gerçek Değer", "%95 PI"])
+        self.meas_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self.meas_table.setMinimumHeight(220)
+        ml.addWidget(self.meas_table)
+
+        # Giriş notu
+        ml.addWidget(info_label(
+            "💡  'Gerçek Değer' sütununa ölçüm sonuçlarınızı girin. "
+            "Diğer sütunlar otomatik hesaplanır."))
+        left.addWidget(meas_card, 1)
+
+        # Değerlendir butonu
+        self.btn_eval = make_btn("▶  Değerlendir", "rgba(20,80,20,0.9)", 42)
+        self.btn_eval.setStyleSheet(self.btn_eval.styleSheet() +
+                                    "font-size:14px; font-weight:bold;")
+        self.btn_eval.clicked.connect(self._evaluate)
+        left.addWidget(self.btn_eval)
+
+        left_w = QWidget(); left_w.setLayout(left)
+        left_w.setMinimumWidth(480); left_w.setMaximumWidth(560)
+
+        # ── Sağ: Sonuç paneli ─────────────────────────────────────────────────
+        right = QVBoxLayout()
+        right.setSpacing(8)
+
+        # Genel skor
+        self.score_card = card_frame()
+        sc = QHBoxLayout(self.score_card)
+        sc.setContentsMargins(20, 12, 20, 12)
+        sc.setSpacing(30)
+
+        self.lbl_overall  = QLabel("—")
+        self.lbl_overall.setStyleSheet(
+            f"color:{GOLD}; font-size:28px; font-weight:bold; background:transparent;")
+        sc.addWidget(self.lbl_overall)
+
+        self.lbl_pass_count = QLabel("—")
+        self.lbl_pass_count.setStyleSheet(
+            f"color:{TXT}; font-size:14px; background:transparent;")
+        sc.addWidget(self.lbl_pass_count)
+
+        self.lbl_model_quality = QLabel("—")
+        self.lbl_model_quality.setStyleSheet(
+            f"color:{TXT2}; font-size:12px; background:transparent;")
+        self.lbl_model_quality.setWordWrap(True)
+        sc.addWidget(self.lbl_model_quality, 1)
+        right.addWidget(self.score_card)
+
+        # Detay sonuç tablosu
+        right.addWidget(section_label("📋  Tahmin vs Gerçek Karşılaştırma"))
+        self.result_table = QTableWidget()
+        self.result_table.setColumnCount(6)
+        self.result_table.setHorizontalHeaderLabels(
+            ["Yanıt", "Tahmin", "Gerçek", "Sapma %", "PI İçinde", "Karar"])
+        self.result_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self.result_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.result_table.setMinimumHeight(200)
+        right.addWidget(self.result_table)
+
+        # Grafik
+        right.addWidget(section_label("📊  Görsel Karşılaştırma"))
+        self.fig = Figure(figsize=(9, 3.5), facecolor=BG2)
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setFixedHeight(220)
+        self.canvas.setStyleSheet(f"background:{BG2};")
+        right.addWidget(self.canvas)
+
+        # Model güvenilirlik notu
+        self.note_lbl = QLabel("")
+        self.note_lbl.setStyleSheet(
+            f"color:{TXT2}; font-size:11px; background:transparent;")
+        self.note_lbl.setWordWrap(True)
+        right.addWidget(self.note_lbl)
+
+        right_w = QWidget(); right_w.setLayout(right)
+        outer.addWidget(left_w)
+        outer.addWidget(right_w, 1)
+
+    # ── Public ───────────────────────────────────────────────────────────────
+    def refresh(self):
+        if not self.project.opt_solutions:
+            return
+        self._populate_opt_combo()
+        self._build_meas_table()
+
+    # ── İç metodlar ──────────────────────────────────────────────────────────
+    def _populate_opt_combo(self):
+        self.opt_combo.blockSignals(True)
+        self.opt_combo.clear()
+        for i, sol in enumerate(self.project.opt_solutions):
+            d = sol["desirability"]
+            self.opt_combo.addItem(f"#{i+1}  D={d:.4f}", i)
+        self.opt_combo.blockSignals(False)
+        self._on_opt_changed(0)
+
+    def _on_opt_changed(self, idx):
+        sol_idx = self.opt_combo.currentData()
+        if sol_idx is None or sol_idx >= len(self.project.opt_solutions):
+            return
+        sol = self.project.opt_solutions[sol_idx]
+        parts = []
+        for f in self.project.factors:
+            val = sol["factors"].get(f["name"], 0)
+            unit = f.get("unit", "")
+            parts.append(f"{f['name']}: {val:.4f} {unit}".strip())
+        self.factor_lbl.setText("  |  ".join(parts))
+        self._build_meas_table()
+
+    def _get_current_sol(self):
+        sol_idx = self.opt_combo.currentData()
+        if sol_idx is None:
+            return None
+        sols = self.project.opt_solutions
+        if sol_idx >= len(sols):
+            return None
+        return sols[sol_idx]
+
+    def _build_meas_table(self):
+        sol = self._get_current_sol()
+        if sol is None:
+            return
+
+        active = [r for r in self.project.responses
+                  if r in self.project.model_results]
+        self.meas_table.setRowCount(len(active))
+
+        for ri, resp_key in enumerate(active):
+            label = RESPONSE_LABELS.get(resp_key, resp_key)
+            pred  = sol["predictions"].get(resp_key)
+
+            # %95 PI hesapla
+            pi_lo, pi_hi = self._calc_pi(resp_key, sol)
+
+            # Mevcut kayıtlı değeri yükle
+            saved = self.project.validation_results.get(resp_key, {}).get("actual", "")
+
+            items_data = [
+                (label,    False),
+                (f"{pred:.4f}" if pred is not None else "—", False),
+                (str(saved) if saved != "" else "",           True),   # Düzenlenebilir
+                (f"[{pi_lo:.3f}, {pi_hi:.3f}]"
+                 if pi_lo is not None else "—",               False),
+            ]
+            for ci, (txt, editable) in enumerate(items_data):
+                item = QTableWidgetItem(txt)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if editable:
+                    item.setBackground(QColor("#0d2010"))
+                    item.setForeground(QColor(TXT))
+                else:
+                    item.setBackground(QColor(BG3))
+                    item.setForeground(QColor(TXT2))
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled |
+                                  Qt.ItemFlag.ItemIsSelectable)
+                self.meas_table.setItem(ri, ci, item)
+
+    def _calc_pi(self, resp_key, sol):
+        """Tahmin için %95 güven aralığı (PI) hesapla."""
+        try:
+            import statsmodels.api as sm
+            p      = self.project
+            safe   = p.get_safe_names()
+            factors = p.factors
+            n_factors = len(factors)
+            res    = p.model_results[resp_key]
+            model  = res["model"]
+
+            def encode(val, f):
+                lo, hi = f["low"], f["high"]
+                mid = f.get("mid", (lo+hi)/2)
+                if hi == lo: return 0.0
+                if val <= mid and (mid-lo) != 0:
+                    return (val-lo)/(mid-lo) - 1
+                elif (hi-mid) != 0:
+                    return (val-mid)/(hi-mid)
+                return 0.0
+
+            row = {}
+            for i, f in enumerate(factors):
+                row[safe[i]] = encode(sol["factors"].get(f["name"], 0), f)
+            for name in safe:
+                row[f"{name}_sq"] = row[name]**2
+            for a in range(n_factors):
+                for b in range(a+1, n_factors):
+                    row[f"{safe[a]}_x_{safe[b]}"] = row[safe[a]]*row[safe[b]]
+
+            df_row  = pd.DataFrame([row])
+            row_mat = sm.add_constant(df_row, has_constant="add")
+            for col in model.params.index:
+                if col not in row_mat.columns:
+                    row_mat[col] = 0.0
+            row_mat = row_mat.reindex(columns=model.params.index, fill_value=0.0)
+
+            pred_res = model.get_prediction(row_mat)
+            pi = pred_res.summary_frame(alpha=0.05)
+            return float(pi["obs_ci_lower"].iloc[0]), float(pi["obs_ci_upper"].iloc[0])
+        except Exception:
+            return None, None
+
+    def _evaluate(self):
+        sol = self._get_current_sol()
+        if sol is None:
+            QMessageBox.warning(self, "", "Önce Optimizasyon sekmesinden optimum belirleyin.")
+            return
+
+        active = [r for r in self.project.responses
+                  if r in self.project.model_results]
+
+        # Gerçek değerleri topla
+        measured = {}
+        for ri, resp_key in enumerate(active):
+            item = self.meas_table.item(ri, 2)
+            if item is None:
+                continue
+            txt = item.text().strip().replace(",", ".")
+            if txt:
+                try:
+                    measured[resp_key] = float(txt)
+                except ValueError:
+                    QMessageBox.warning(self, "Hata",
+                        f"{RESPONSE_LABELS.get(resp_key,resp_key)}: geçersiz değer '{txt}'")
+                    return
+
+        if not measured:
+            QMessageBox.warning(self, "", "En az 1 yanıt için gerçek değer girin.")
+            return
+
+        crit = self.crit_spin.value() / 100.0
+
+        # Karşılaştırma hesapla
+        comparisons = []
+        for resp_key in active:
+            if resp_key not in measured:
+                continue
+            pred   = sol["predictions"].get(resp_key)
+            actual = measured[resp_key]
+            pi_lo, pi_hi = self._calc_pi(resp_key, sol)
+
+            if pred is not None and pred != 0:
+                dev_pct = abs(actual - pred) / abs(pred) * 100
+            else:
+                dev_pct = None
+
+            in_pi   = (pi_lo is not None and pi_hi is not None and
+                       pi_lo <= actual <= pi_hi)
+            in_crit = dev_pct is not None and dev_pct <= crit * 100
+            passed  = in_pi or in_crit
+
+            comparisons.append({
+                "resp_key": resp_key,
+                "pred":     pred,
+                "actual":   actual,
+                "dev_pct":  dev_pct,
+                "in_pi":    in_pi,
+                "passed":   passed,
+                "pi_lo":    pi_lo,
+                "pi_hi":    pi_hi,
+            })
+
+            # Sonuçları kaydet
+            self.project.validation_results[resp_key] = {
+                "actual":  actual,
+                "passed":  passed,
+                "dev_pct": dev_pct,
+            }
+
+        self._show_results(comparisons)
+
+    def _show_results(self, comparisons):
+        n_pass  = sum(1 for c in comparisons if c["passed"])
+        n_total = len(comparisons)
+        all_pass = n_pass == n_total
+
+        # Genel skor
+        score_color = GREEN if all_pass else GOLD if n_pass >= n_total*0.6 else RED
+        score_text  = "PASS ✅" if all_pass else f"KISMİ ⚠  {n_pass}/{n_total}" \
+                      if n_pass > 0 else "FAIL ✗"
+        self.lbl_overall.setText(score_text)
+        self.lbl_overall.setStyleSheet(
+            f"color:{score_color}; font-size:22px; font-weight:bold; background:transparent;")
+        self.lbl_pass_count.setText(
+            f"{n_pass}/{n_total} yanıt\nkabul kriterini karşıladı")
+
+        # Model güvenilirlik yorumu
+        if all_pass:
+            quality = "Model tahminleri doğrulandı. Formülasyon güvenle üretime alınabilir."
+        elif n_pass >= n_total * 0.6:
+            quality = ("Çoğu tahmin doğrulandı. Başarısız yanıtlar için modeli "
+                       "ek run'larla iyileştirmeyi düşünün.")
+        else:
+            quality = ("Model yetersiz doğrulandı. Ek deney run'ları ekleyip "
+                       "modeli yeniden kurun.")
+        self.lbl_model_quality.setText(quality)
+
+        # Detay tablo
+        self.result_table.setRowCount(len(comparisons))
+        for ri, c in enumerate(comparisons):
+            label    = RESPONSE_LABELS.get(c["resp_key"], c["resp_key"])
+            dev_str  = f"{c['dev_pct']:.2f}%" if c["dev_pct"] is not None else "—"
+            pi_str   = "✅ Evet" if c["in_pi"] else "✗ Hayır"
+            karar    = "PASS ✅" if c["passed"] else "FAIL ✗"
+            bg_color = QColor("#0a2a0a") if c["passed"] else QColor("#2a0a0a")
+            fg_karar = QColor(GREEN)     if c["passed"] else QColor(RED)
+
+            row_items = [
+                (label,                             TXT),
+                (f"{c['pred']:.4f}" if c["pred"] is not None else "—", TXT2),
+                (f"{c['actual']:.4f}",              TXT),
+                (dev_str,
+                 GREEN if c["dev_pct"] is not None and c["dev_pct"] <= 15 else
+                 GOLD  if c["dev_pct"] is not None and c["dev_pct"] <= 25 else RED),
+                (pi_str, GREEN if c["in_pi"] else RED),
+                (karar, fg_karar),
+            ]
+            for ci, (txt, fg) in enumerate(row_items):
+                item = QTableWidgetItem(txt)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setBackground(bg_color)
+                item.setForeground(fg if isinstance(fg, QColor) else QColor(fg))
+                self.result_table.setItem(ri, ci, item)
+
+        # Grafik
+        self._plot_comparison(comparisons)
+
+        # Öneri notu
+        devs = [c["dev_pct"] for c in comparisons if c["dev_pct"] is not None]
+        if devs:
+            mean_dev = sum(devs) / len(devs)
+            self.note_lbl.setText(
+                f"Ortalama sapma: {mean_dev:.2f}%  |  "
+                f"Maks sapma: {max(devs):.2f}%  |  "
+                f"Model: {'Uygun ✅' if mean_dev <= 15 else 'Gözden Geçirin ⚠'}")
+
+        self.app.status_bar.showMessage(
+            f"Doğrulama tamamlandı — {n_pass}/{n_total} PASS", 6000)
+
+    def _plot_comparison(self, comparisons):
+        self.fig.clear()
+        self.fig.patch.set_facecolor(BG2)
+
+        n = len(comparisons)
+        if n == 0:
+            return
+
+        axes = self.fig.subplots(1, 2)
+
+        # Sol: Tahmin vs Gerçek scatter
+        ax1 = axes[0]
+        ax1.set_facecolor(BG3)
+        ax1.tick_params(colors=TXT2, labelsize=8)
+        for spine in ax1.spines.values():
+            spine.set_edgecolor("#2a4060")
+
+        preds   = [c["pred"] for c in comparisons if c["pred"] is not None]
+        actuals = [c["actual"] for c in comparisons]
+        colors  = [GREEN if c["passed"] else RED for c in comparisons]
+
+        ax1.scatter(preds, actuals, c=colors, s=80, zorder=3,
+                    edgecolors="white", linewidths=0.6, alpha=0.9)
+
+        if preds and actuals:
+            mn = min(min(preds), min(actuals))
+            mx = max(max(preds), max(actuals))
+            pad = (mx - mn) * 0.1 or 0.1
+            ax1.plot([mn-pad, mx+pad], [mn-pad, mx+pad],
+                     '--', color=GOLD, lw=1.2, label="İdeal")
+            # ±15% bantları
+            ax1.plot([mn-pad, mx+pad],
+                     [(mn-pad)*0.85, (mx+pad)*0.85],
+                     ':', color=TXT2, lw=0.8, alpha=0.5)
+            ax1.plot([mn-pad, mx+pad],
+                     [(mn-pad)*1.15, (mx+pad)*1.15],
+                     ':', color=TXT2, lw=0.8, alpha=0.5, label="±15%")
+
+        for c in comparisons:
+            if c["pred"] is not None:
+                ax1.annotate(
+                    RESPONSE_LABELS.get(c["resp_key"], c["resp_key"])[:6],
+                    (c["pred"], c["actual"]),
+                    textcoords="offset points", xytext=(5, 3),
+                    fontsize=7, color=TXT2)
+
+        ax1.set_xlabel("Tahmin", color=TXT2, fontsize=8)
+        ax1.set_ylabel("Gerçek", color=TXT2, fontsize=8)
+        ax1.set_title("Tahmin vs Gerçek", color=GOLD, fontsize=9)
+        ax1.legend(fontsize=7, labelcolor=TXT2,
+                   facecolor=BG2, edgecolor="#2a4060")
+
+        # Sağ: Sapma % çubuk grafik
+        ax2 = axes[1]
+        ax2.set_facecolor(BG3)
+        ax2.tick_params(colors=TXT2, labelsize=8)
+        for spine in ax2.spines.values():
+            spine.set_edgecolor("#2a4060")
+
+        labels  = [RESPONSE_LABELS.get(c["resp_key"], c["resp_key"])
+                   for c in comparisons]
+        devs    = [c["dev_pct"] if c["dev_pct"] is not None else 0
+                   for c in comparisons]
+        bar_col = [GREEN if d <= 15 else GOLD if d <= 25 else RED for d in devs]
+
+        bars = ax2.bar(range(len(devs)), devs, color=bar_col,
+                       alpha=0.85, edgecolor="#2a4060")
+        ax2.set_xticks(range(len(labels)))
+        ax2.set_xticklabels(labels, rotation=25, ha="right",
+                             fontsize=7, color=TXT2)
+        ax2.axhline(15, color=GOLD,  lw=1.2, linestyle="--", label="±15%")
+        ax2.axhline(25, color=RED,   lw=1.0, linestyle=":",  label="±25%")
+        ax2.set_ylabel("Sapma (%)", color=TXT2, fontsize=8)
+        ax2.set_title("Tahmin Sapma %", color=GOLD, fontsize=9)
+        ax2.legend(fontsize=7, labelcolor=TXT2,
+                   facecolor=BG2, edgecolor="#2a4060")
+
+        for bar, val in zip(bars, devs):
+            ax2.text(bar.get_x() + bar.get_width()/2,
+                     val + 0.3, f"{val:.1f}",
+                     ha="center", va="bottom", color=TXT, fontsize=7)
+
+        self.fig.tight_layout(pad=1.5)
+        self.canvas.draw()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PLACEHOLDER SEKMELER (Adım 5-7 için)
 # ═══════════════════════════════════════════════════════════════════════════════
 class PlaceholderTab(QWidget):
@@ -3461,11 +3963,7 @@ class FormulasyonOptimizerApp(QMainWindow):
         self.tabs.addTab(self.tab6, "6 · Design Space")
 
         # Sekme 7 — Doğrulama
-        self.tab7 = PlaceholderTab(
-            "Doğrulama",
-            "Optimum formülasyonun tahmin değerleri ile\n"
-            "gerçek NGI ölçümlerinin karşılaştırması.",
-            "✅")
+        self.tab7 = Tab7_Validation(self.project, self)
         self.tabs.addTab(self.tab7, "7 · Doğrulama")
 
         # ── Durum çubuğu ─────────────────────────────────────────────────────
