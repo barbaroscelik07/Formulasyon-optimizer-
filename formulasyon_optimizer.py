@@ -1287,7 +1287,500 @@ class Tab2_DataEntry(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PLACEHOLDER SEKMELER (Adım 3-7 için)
+# SEKME 3 — MODEL
+# ═══════════════════════════════════════════════════════════════════════════════
+class ModelWorker(QThread):
+    """OLS model fit işlemini arka planda çalıştırır."""
+    finished = pyqtSignal(dict, dict)   # results, errors
+    progress = pyqtSignal(str)
+
+    def __init__(self, project):
+        super().__init__()
+        self.project = project
+
+    def run(self):
+        import statsmodels.api as sm
+        from statsmodels.stats.anova import anova_lm
+        import statsmodels.formula.api as smf
+
+        results = {}
+        errors  = {}
+        p       = self.project
+        safe    = p.get_safe_names()
+
+        # Yanıt verisini topla
+        resp_df = p.build_response_table()
+        if resp_df is None or resp_df.empty:
+            errors["_global"] = "Yanıt verisi bulunamadı."
+            self.finished.emit(results, errors)
+            return
+
+        # Kodlanmış faktör matrisi
+        coded_df, _ = p.get_coded_df()
+        if coded_df is None:
+            errors["_global"] = "Tasarım matrisi bulunamadı."
+            self.finished.emit(results, errors)
+            return
+
+        # Her yanıt için model kur
+        for resp_key in p.responses:
+            self.progress.emit(f"Model kuruluyor: {RESPONSE_LABELS.get(resp_key, resp_key)}")
+            try:
+                y = resp_df[resp_key].values
+                # Eksik satırları çıkar
+                mask = np.array([isinstance(v, float) and not np.isnan(v) for v in y])
+                if mask.sum() < len(safe) + 2:
+                    errors[resp_key] = f"Yeterli veri yok (min {len(safe)+2} run)."
+                    continue
+
+                X_df   = coded_df[mask].copy()
+                y_clean = y[mask].astype(float)
+
+                # Quadratic model için karşılıklı etkiler + karesel terimler
+                n_factors = len(safe)
+                X_df = X_df.reset_index(drop=True)
+                y_s  = pd.Series(y_clean, name=resp_key)
+
+                # Karesel terimler
+                for name in safe:
+                    X_df[f"{name}_sq"] = X_df[name] ** 2
+
+                # İkili etkileşimler
+                for i in range(n_factors):
+                    for j in range(i+1, n_factors):
+                        col = f"{safe[i]}_x_{safe[j]}"
+                        X_df[col] = X_df[safe[i]] * X_df[safe[j]]
+
+                X_mat = sm.add_constant(X_df)
+                model = sm.OLS(y_s, X_mat).fit()
+
+                # ANOVA
+                try:
+                    anova = sm.stats.anova_lm(model, typ=2)
+                except Exception:
+                    anova = None
+
+                # Artık normallik testi
+                try:
+                    _, sw_p = stats.shapiro(model.resid)
+                except Exception:
+                    sw_p = None
+
+                results[resp_key] = {
+                    "model":     model,
+                    "anova":     anova,
+                    "X_df":      X_df,
+                    "y":         y_clean,
+                    "sw_p":      sw_p,
+                    "r2":        model.rsquared,
+                    "r2_adj":    model.rsquared_adj,
+                    "rmse":      np.sqrt(model.mse_resid),
+                    "f_pvalue":  model.f_pvalue,
+                    "safe_names": safe,
+                    "n_obs":     int(mask.sum()),
+                }
+
+            except Exception as e:
+                errors[resp_key] = str(e)
+
+        self.finished.emit(results, errors)
+
+
+class Tab3_Model(QWidget):
+    """Sekme 3 — OLS model fit, R², ANOVA, katsayı tablosu, artık grafikleri."""
+
+    model_ready = pyqtSignal()
+
+    def __init__(self, project: OptimizerProject, app_ref, parent=None):
+        super().__init__(parent)
+        self.project = project
+        self.app     = app_ref
+        self._worker = None
+        self._build()
+
+    def _build(self):
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(12)
+
+        # ── Sol: kontroller + özet tablo ──────────────────────────────────────
+        left = QVBoxLayout()
+        left.setSpacing(10)
+
+        # Başlık + buton
+        top = QHBoxLayout()
+        top.addWidget(section_label("📈  Regresyon Modeli"))
+        top.addStretch()
+        self.btn_fit = make_btn("▶  Model Kur", "rgba(20,80,20,0.9)", 34)
+        self.btn_fit.setStyleSheet(self.btn_fit.styleSheet() +
+                                   "font-size:13px; font-weight:bold;")
+        self.btn_fit.clicked.connect(self._fit_models)
+        top.addWidget(self.btn_fit)
+        left.addLayout(top)
+
+        # Model tipi açıklaması
+        info = info_label(
+            "Quadratic (ikinci dereceden) model: ana etkiler + ikili etkileşimler + "
+            "karesel terimler. Seçilen yanıt değişkenlerine ayrı ayrı OLS modeli kurulur.")
+        left.addWidget(info)
+
+        # Yanıt seçim combo
+        resp_row = QHBoxLayout()
+        resp_row.addWidget(QLabel("Yanıt:"))
+        self.resp_combo = QComboBox()
+        self.resp_combo.setFixedHeight(28)
+        self.resp_combo.currentTextChanged.connect(self._on_resp_changed)
+        resp_row.addWidget(self.resp_combo)
+        resp_row.addStretch()
+        left.addLayout(resp_row)
+
+        # ── Özet kart ─────────────────────────────────────────────────────────
+        sum_card = card_frame()
+        sl = QGridLayout(sum_card)
+        sl.setContentsMargins(14, 10, 14, 10)
+        sl.setSpacing(8)
+
+        def stat_pair(label, attr):
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f"color:{TXT2}; font-size:11px; background:transparent;")
+            val = QLabel("—")
+            val.setStyleSheet(f"color:{GOLD}; font-size:14px; font-weight:bold; background:transparent;")
+            setattr(self, attr, val)
+            return lbl, val
+
+        for row, (lbl_txt, attr) in enumerate([
+            ("R²",           "lbl_r2"),
+            ("Adj R²",       "lbl_r2adj"),
+            ("RMSE",         "lbl_rmse"),
+            ("Model p",      "lbl_fp"),
+            ("Shapiro-Wilk p", "lbl_swp"),
+            ("Gözlem (n)",   "lbl_nobs"),
+        ]):
+            lbl, val = stat_pair(lbl_txt, attr)
+            sl.addWidget(lbl, row, 0)
+            sl.addWidget(val, row, 1)
+
+        left.addWidget(sum_card)
+
+        # ── Katsayı tablosu ───────────────────────────────────────────────────
+        left.addWidget(section_label("🔢  Katsayılar & Anlamlılık"))
+        self.coef_table = QTableWidget()
+        self.coef_table.setColumnCount(5)
+        self.coef_table.setHorizontalHeaderLabels(
+            ["Terim", "Katsayı", "Std Hata", "t", "p"])
+        self.coef_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents)
+        self.coef_table.horizontalHeader().setStretchLastSection(True)
+        self.coef_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.coef_table.setMinimumHeight(200)
+        left.addWidget(self.coef_table, 1)
+
+        # ── ANOVA tablosu ─────────────────────────────────────────────────────
+        left.addWidget(section_label("📊  ANOVA Tablosu"))
+        self.anova_table = QTableWidget()
+        self.anova_table.setColumnCount(5)
+        self.anova_table.setHorizontalHeaderLabels(
+            ["Kaynak", "SS", "df", "MS", "p"])
+        self.anova_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents)
+        self.anova_table.horizontalHeader().setStretchLastSection(True)
+        self.anova_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.anova_table.setFixedHeight(180)
+        left.addWidget(self.anova_table)
+
+        left_w = QWidget()
+        left_w.setLayout(left)
+        left_w.setMinimumWidth(480)
+        left_w.setMaximumWidth(560)
+
+        # ── Sağ: Artık grafikleri ─────────────────────────────────────────────
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        right.addWidget(section_label("🔬  Artık (Residual) Analizi"))
+
+        # 4 grafik: Predicted vs Actual, Residuals vs Fitted,
+        #           Normal Q-Q, Residuals vs Order
+        self.fig = Figure(figsize=(9, 7), facecolor=BG2)
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setStyleSheet(f"background: {BG2};")
+        right.addWidget(self.canvas, 1)
+
+        # Durum mesajı
+        self.status_lbl = QLabel("Model henüz kurulmadı.")
+        self.status_lbl.setStyleSheet(
+            f"color:{TXT2}; font-size:11px; background:transparent;")
+        right.addWidget(self.status_lbl)
+
+        # İleri butonu
+        bot = QHBoxLayout()
+        bot.addStretch()
+        self.btn_next = make_btn("Response Surface  ▶", "rgba(20,80,20,0.8)", 36)
+        self.btn_next.setStyleSheet(self.btn_next.styleSheet() +
+                                    "font-size:13px; font-weight:bold;")
+        self.btn_next.setEnabled(False)
+        self.btn_next.clicked.connect(lambda: self.app.tabs.setCurrentIndex(3))
+        bot.addWidget(self.btn_next)
+        right.addLayout(bot)
+
+        right_w = QWidget()
+        right_w.setLayout(right)
+
+        outer.addWidget(left_w)
+        outer.addWidget(right_w, 1)
+
+    # ── Public ────────────────────────────────────────────────────────────────
+    def refresh(self):
+        if self.project.design_matrix is None:
+            return
+        # Yanıt combo'yu güncelle
+        self.resp_combo.blockSignals(True)
+        self.resp_combo.clear()
+        for r in self.project.responses:
+            self.resp_combo.addItem(RESPONSE_LABELS.get(r, r), r)
+        self.resp_combo.blockSignals(False)
+        # Daha önce model kurulmuşsa sonuçları göster
+        if self.project.model_results:
+            self._show_results_for_current()
+
+    # ── Model fit ─────────────────────────────────────────────────────────────
+    def _fit_models(self):
+        if self.project.design_matrix is None:
+            QMessageBox.warning(self, "", "Önce Deney Tasarımı sekmesinden matris oluşturun.")
+            return
+        filled = sum(1 for i in range(len(self.project.design_matrix))
+                     if self.project.run_results.get(i))
+        if filled == 0:
+            QMessageBox.warning(self, "", "Önce Veri Girişi sekmesinden NGI sonuçlarını girin.")
+            return
+
+        self.btn_fit.setEnabled(False)
+        self.btn_fit.setText("⏳ Hesaplanıyor...")
+        self.status_lbl.setText("Model kuruluyor...")
+
+        self._worker = ModelWorker(self.project)
+        self._worker.finished.connect(self._on_model_done)
+        self._worker.progress.connect(
+            lambda msg: self.app.status_bar.showMessage(msg))
+        self._worker.start()
+
+    def _on_model_done(self, results, errors):
+        self.btn_fit.setEnabled(True)
+        self.btn_fit.setText("▶  Model Kur")
+
+        if "_global" in errors:
+            QMessageBox.critical(self, "Hata", errors["_global"])
+            return
+
+        self.project.model_results = results
+        self.project.model_errors  = errors
+
+        # Combo güncelle
+        self.resp_combo.blockSignals(True)
+        self.resp_combo.clear()
+        for r in self.project.responses:
+            label = RESPONSE_LABELS.get(r, r)
+            if r in errors:
+                label += "  ⚠"
+            self.resp_combo.addItem(label, r)
+        self.resp_combo.blockSignals(False)
+
+        self._show_results_for_current()
+        self.btn_next.setEnabled(bool(results))
+        self.model_ready.emit()
+        self.app.status_bar.showMessage(
+            f"Model hazır — {len(results)} yanıt başarıyla modellendi.", 6000)
+
+        if errors:
+            err_list = "\n".join(f"  • {RESPONSE_LABELS.get(k,k)}: {v}"
+                                 for k, v in errors.items() if k != "_global")
+            QMessageBox.warning(self, "Uyarı",
+                f"Bazı yanıtlar modellenemedi:\n{err_list}")
+
+    def _on_resp_changed(self, _):
+        self._show_results_for_current()
+
+    def _show_results_for_current(self):
+        resp_key = self.resp_combo.currentData()
+        if resp_key is None:
+            return
+        res = self.project.model_results.get(resp_key)
+        if res is None:
+            err = self.project.model_errors.get(resp_key, "Model kurulmadı.")
+            self.status_lbl.setText(f"⚠  {err}")
+            self._clear_display()
+            return
+
+        model = res["model"]
+
+        # ── Özet istatistikler ────────────────────────────────────────────────
+        def fmt_p(p):
+            if p is None: return "—"
+            if p < 0.001: return "<0.001 ✅"
+            if p < 0.05:  return f"{p:.4f} ✅"
+            return f"{p:.4f} ⚠"
+
+        def color_r2(v):
+            c = GREEN if v >= 0.9 else GOLD if v >= 0.7 else RED
+            return f'<span style="color:{c}">{v:.4f}</span>'
+
+        self.lbl_r2.setText(f"{res['r2']:.4f}")
+        self.lbl_r2.setStyleSheet(
+            f"color:{'#00B050' if res['r2']>=0.9 else '#FFC600' if res['r2']>=0.7 else '#C00000'};"
+            f"font-size:14px;font-weight:bold;background:transparent;")
+        self.lbl_r2adj.setText(f"{res['r2_adj']:.4f}")
+        self.lbl_rmse.setText(f"{res['rmse']:.4f}")
+        self.lbl_fp.setText(fmt_p(res['f_pvalue']))
+        sw_p = res.get("sw_p")
+        self.lbl_swp.setText(
+            f"{sw_p:.4f} {'✅ Normal' if sw_p and sw_p>0.05 else '⚠ Normal değil'}"
+            if sw_p else "—")
+        self.lbl_nobs.setText(str(res["n_obs"]))
+
+        # ── Katsayı tablosu ───────────────────────────────────────────────────
+        params  = model.params
+        bse     = model.bse
+        tvalues = model.tvalues
+        pvalues = model.pvalues
+
+        self.coef_table.setRowCount(len(params))
+        for i, (name, coef) in enumerate(params.items()):
+            p_val = pvalues[name]
+            significant = p_val < 0.05
+
+            name_item = QTableWidgetItem(name)
+            if significant:
+                name_item.setForeground(QColor(GREEN))
+                name_item.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            else:
+                name_item.setForeground(QColor(TXT2))
+
+            items = [
+                name_item,
+                QTableWidgetItem(f"{coef:.4f}"),
+                QTableWidgetItem(f"{bse[name]:.4f}"),
+                QTableWidgetItem(f"{tvalues[name]:.3f}"),
+                QTableWidgetItem(f"{p_val:.4f}"),
+            ]
+            for j, item in enumerate(items):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if j > 0:
+                    if significant:
+                        item.setBackground(QColor("#0a2a0a"))
+                    else:
+                        item.setBackground(QColor(BG3))
+                self.coef_table.setItem(i, j, item)
+
+            # p-değeri renklendirme
+            p_item = self.coef_table.item(i, 4)
+            if p_val < 0.001:
+                p_item.setForeground(QColor(GREEN))
+            elif p_val < 0.05:
+                p_item.setForeground(QColor("#90e890"))
+            elif p_val < 0.1:
+                p_item.setForeground(QColor(GOLD))
+            else:
+                p_item.setForeground(QColor(TXT2))
+
+        # ── ANOVA tablosu ─────────────────────────────────────────────────────
+        anova = res.get("anova")
+        if anova is not None:
+            self.anova_table.setRowCount(len(anova))
+            for i, (src, row) in enumerate(anova.iterrows()):
+                p_v = row.get("PR(>F)", np.nan)
+                items = [
+                    QTableWidgetItem(str(src)),
+                    QTableWidgetItem(f"{row.get('sum_sq', 0):.4f}"),
+                    QTableWidgetItem(f"{int(row.get('df', 0))}"),
+                    QTableWidgetItem(f"{row.get('sum_sq', 0)/max(row.get('df',1),1):.4f}"),
+                    QTableWidgetItem(f"{p_v:.4f}" if not np.isnan(p_v) else "—"),
+                ]
+                for j, item in enumerate(items):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setBackground(QColor(BG3 if i % 2 == 0 else BG2))
+                    if j == 4 and not np.isnan(p_v):
+                        item.setForeground(
+                            QColor(GREEN if p_v < 0.05 else TXT2))
+                    self.anova_table.setItem(i, j, item)
+
+        # ── Artık grafikleri ──────────────────────────────────────────────────
+        self._plot_residuals(res)
+
+        self.status_lbl.setText(
+            f"✅  Model hazır  |  R²={res['r2']:.4f}  |  Adj R²={res['r2_adj']:.4f}  "
+            f"|  n={res['n_obs']}")
+
+    def _clear_display(self):
+        self.coef_table.setRowCount(0)
+        self.anova_table.setRowCount(0)
+        self.fig.clear()
+        self.canvas.draw()
+        for attr in ["lbl_r2","lbl_r2adj","lbl_rmse","lbl_fp","lbl_swp","lbl_nobs"]:
+            getattr(self, attr).setText("—")
+
+    def _plot_residuals(self, res):
+        model = res["model"]
+        fitted   = model.fittedvalues.values
+        residuals = model.resid.values
+        y_actual  = res["y"]
+
+        self.fig.clear()
+        self.fig.patch.set_facecolor(BG2)
+
+        axes = self.fig.subplots(2, 2)
+        plot_cfg = dict(facecolor=BG3, labelcolor=TXT, titlecolor=GOLD)
+
+        for ax in axes.flat:
+            ax.set_facecolor(BG3)
+            ax.tick_params(colors=TXT2, labelsize=8)
+            ax.xaxis.label.set_color(TXT2)
+            ax.yaxis.label.set_color(TXT2)
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#2a4060")
+
+        # 1. Predicted vs Actual
+        ax1 = axes[0, 0]
+        mn = min(min(y_actual), min(fitted))
+        mx = max(max(y_actual), max(fitted))
+        ax1.scatter(y_actual, fitted, color=CP[0], s=40, zorder=3, alpha=0.85)
+        ax1.plot([mn, mx], [mn, mx], '--', color=GOLD, lw=1, label="İdeal")
+        ax1.set_xlabel("Gerçek"); ax1.set_ylabel("Tahmin")
+        ax1.set_title("Tahmin vs Gerçek", color=GOLD, fontsize=9)
+        ax1.legend(fontsize=7, labelcolor=TXT2,
+                   facecolor=BG2, edgecolor="#2a4060")
+
+        # 2. Residuals vs Fitted
+        ax2 = axes[0, 1]
+        ax2.scatter(fitted, residuals, color=CP[1], s=40, zorder=3, alpha=0.85)
+        ax2.axhline(0, color=GOLD, lw=1, linestyle="--")
+        ax2.set_xlabel("Tahmin"); ax2.set_ylabel("Artık")
+        ax2.set_title("Artık vs Tahmin", color=GOLD, fontsize=9)
+
+        # 3. Normal Q-Q
+        ax3 = axes[1, 0]
+        (osm, osr), (slope, intercept, _) = stats.probplot(residuals)
+        ax3.scatter(osm, osr, color=CP[2], s=30, zorder=3, alpha=0.85)
+        line_x = np.array([osm[0], osm[-1]])
+        ax3.plot(line_x, slope * line_x + intercept,
+                 '--', color=GOLD, lw=1)
+        ax3.set_xlabel("Teorik Kantil"); ax3.set_ylabel("Örnek Kantil")
+        ax3.set_title("Normal Q-Q", color=GOLD, fontsize=9)
+
+        # 4. Residuals vs Order
+        ax4 = axes[1, 1]
+        ax4.plot(range(1, len(residuals)+1), residuals,
+                 'o-', color=CP[3], markersize=4, lw=1, alpha=0.85)
+        ax4.axhline(0, color=GOLD, lw=1, linestyle="--")
+        ax4.set_xlabel("Gözlem Sırası"); ax4.set_ylabel("Artık")
+        ax4.set_title("Artık vs Sıra", color=GOLD, fontsize=9)
+
+        self.fig.tight_layout(pad=1.5)
+        self.canvas.draw()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PLACEHOLDER SEKMELER (Adım 4-7 için)
 # ═══════════════════════════════════════════════════════════════════════════════
 class PlaceholderTab(QWidget):
     """Henüz geliştirilmemiş sekmeler için yer tutucu."""
@@ -1405,11 +1898,8 @@ class FormulasyonOptimizerApp(QMainWindow):
         self.tabs.addTab(self.tab2, "2 · Veri Girişi")
 
         # Sekme 3 — Model
-        self.tab3 = PlaceholderTab(
-            "Model",
-            "Veri girişi tamamlandıktan sonra OLS regresyon modeli kurulur.\n"
-            "R², ANOVA tablosu ve katsayı analizi burada görünecek.",
-            "📈")
+        self.tab3 = Tab3_Model(self.project, self)
+        self.tab3.model_ready.connect(lambda: None)
         self.tabs.addTab(self.tab3, "3 · Model")
 
         # Sekme 4 — Response Surface
