@@ -416,14 +416,20 @@ class OptimizerProject:
         return df, safe_names
 
     def build_response_table(self):
-        """Run sonuçlarını DataFrame olarak döner."""
-        if self.design_matrix is None or not self.run_results:
+        """Run sonuçlarını DataFrame olarak döner — eksik değerler NaN."""
+        if self.design_matrix is None:
             return None
         rows = []
         for i in range(len(self.design_matrix)):
-            row = dict(self.run_results.get(i, {}))
+            row = {}
+            for resp in self.responses:
+                val = self.run_results.get(i, {}).get(resp, None)
+                try:
+                    row[resp] = float(val) if val is not None else np.nan
+                except (TypeError, ValueError):
+                    row[resp] = np.nan
             rows.append(row)
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=self.responses)
 
     def generate_design_matrix(self):
         """Seçilen tasarım tipine göre matris oluşturur."""
@@ -1326,20 +1332,26 @@ class ModelWorker(QThread):
         for resp_key in p.responses:
             self.progress.emit(f"Model kuruluyor: {RESPONSE_LABELS.get(resp_key, resp_key)}")
             try:
-                y = resp_df[resp_key].values
-                # Eksik satırları çıkar
-                mask = np.array([isinstance(v, float) and not np.isnan(v) for v in y])
-                if mask.sum() < len(safe) + 2:
-                    errors[resp_key] = f"Yeterli veri yok (min {len(safe)+2} run)."
+                # Sütun yoksa atla
+                if resp_key not in resp_df.columns:
+                    errors[resp_key] = "Yanıt sütunu bulunamadı."
                     continue
 
-                X_df   = coded_df[mask].copy()
-                y_clean = y[mask].astype(float)
+                y = resp_df[resp_key].values.astype(float)
 
-                # Quadratic model için karşılıklı etkiler + karesel terimler
+                # Eksik satırları çıkar (NaN olanlar)
+                mask = ~np.isnan(y)
+                min_obs = len(safe) + 2
+                if mask.sum() < min_obs:
+                    errors[resp_key] = (
+                        f"Yeterli veri yok: {int(mask.sum())} run dolu, "
+                        f"en az {min_obs} gerekli.")
+                    continue
+
+                X_df    = coded_df[mask].copy().reset_index(drop=True)
+                y_clean = y[mask]
+                y_s     = pd.Series(y_clean, name=resp_key)
                 n_factors = len(safe)
-                X_df = X_df.reset_index(drop=True)
-                y_s  = pd.Series(y_clean, name=resp_key)
 
                 # Karesel terimler
                 for name in safe:
@@ -1351,7 +1363,7 @@ class ModelWorker(QThread):
                         col = f"{safe[i]}_x_{safe[j]}"
                         X_df[col] = X_df[safe[i]] * X_df[safe[j]]
 
-                X_mat = sm.add_constant(X_df)
+                X_mat = sm.add_constant(X_df, has_constant="add")
                 model = sm.OLS(y_s, X_mat).fit()
 
                 # ANOVA
@@ -1360,28 +1372,32 @@ class ModelWorker(QThread):
                 except Exception:
                     anova = None
 
-                # Artık normallik testi
+                # Artık normallik testi (Shapiro-Wilk 3-5000 arası çalışır)
+                sw_p = None
                 try:
-                    _, sw_p = stats.shapiro(model.resid)
+                    n_res = len(model.resid)
+                    if 3 <= n_res <= 5000:
+                        _, sw_p = stats.shapiro(model.resid)
                 except Exception:
-                    sw_p = None
+                    pass
 
                 results[resp_key] = {
-                    "model":     model,
-                    "anova":     anova,
-                    "X_df":      X_df,
-                    "y":         y_clean,
-                    "sw_p":      sw_p,
-                    "r2":        model.rsquared,
-                    "r2_adj":    model.rsquared_adj,
-                    "rmse":      np.sqrt(model.mse_resid),
-                    "f_pvalue":  model.f_pvalue,
+                    "model":      model,
+                    "anova":      anova,
+                    "X_df":       X_df,
+                    "y":          y_clean,
+                    "sw_p":       sw_p,
+                    "r2":         model.rsquared,
+                    "r2_adj":     model.rsquared_adj,
+                    "rmse":       float(np.sqrt(model.mse_resid)),
+                    "f_pvalue":   float(model.f_pvalue),
                     "safe_names": safe,
-                    "n_obs":     int(mask.sum()),
+                    "n_obs":      int(mask.sum()),
                 }
 
             except Exception as e:
-                errors[resp_key] = str(e)
+                import traceback
+                errors[resp_key] = f"{e}\n{traceback.format_exc()}"
 
         self.finished.emit(results, errors)
 
@@ -1970,6 +1986,9 @@ class Tab4_ResponseSurface(QWidget):
         ZZ = np.zeros_like(XX)
         n_factors = len(factors)
 
+        import statsmodels.api as _sm
+        param_idx = model.params.index
+
         for r in range(n):
             for c in range(n):
                 row_vals = {}
@@ -1979,8 +1998,8 @@ class Tab4_ResponseSurface(QWidget):
                     elif k == yi:
                         row_vals[safe[k]] = encode(YY[r, c], f)
                     else:
-                        row_vals[safe[k]] = encode(fixed.get(k, f.get("mid",
-                            (f["low"]+f["high"])/2)), f)
+                        row_vals[safe[k]] = encode(
+                            fixed.get(k, f.get("mid", (f["low"]+f["high"])/2)), f)
 
                 # Karesel ve etkileşim terimleri
                 for name in safe:
@@ -1990,17 +2009,15 @@ class Tab4_ResponseSurface(QWidget):
                         col = f"{safe[a]}_x_{safe[b]}"
                         row_vals[col] = row_vals[safe[a]] * row_vals[safe[b]]
 
-                # pandas zaten yuklu
-                row_df = pd.DataFrame([row_vals])
-                import statsmodels.api as sm
-                row_mat = sm.add_constant(row_df, has_constant="add")
+                row_df  = pd.DataFrame([row_vals])
+                row_mat = _sm.add_constant(row_df, has_constant="add")
                 # Modelin beklediği sütunlarla hizala
-                for col in model.params.index:
+                for col in param_idx:
                     if col not in row_mat.columns:
-                        row_mat[col] = 0
-                row_mat = row_mat[model.params.index]
+                        row_mat[col] = 0.0
+                row_mat = row_mat.reindex(columns=param_idx, fill_value=0.0)
                 try:
-                    ZZ[r, c] = model.predict(row_mat)[0]
+                    ZZ[r, c] = float(model.predict(row_mat)[0])
                 except Exception:
                     ZZ[r, c] = np.nan
 
