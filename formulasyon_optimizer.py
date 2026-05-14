@@ -1389,9 +1389,15 @@ class ModelWorker(QThread):
 
                 # ANOVA
                 try:
-                    anova = sm.stats.anova_lm(model, typ=2)
+                    from statsmodels.stats.anova import anova_lm as _anova_lm
+                    anova = _anova_lm(model, typ=2)
                 except Exception:
-                    anova = None
+                    try:
+                        from statsmodels.stats.anova import anova_lm as _anova_lm
+                        anova = _anova_lm(model, typ=1)
+                    except Exception as _e:
+                        anova = None
+                        write_log(f"ANOVA hesaplanamadı ({resp_key}): {_e}")
 
                 # Artık normallik testi (Shapiro-Wilk 3-5000 arası çalışır)
                 sw_p = None
@@ -1824,8 +1830,9 @@ class Tab4_ResponseSurface(QWidget):
 
     def __init__(self, project: OptimizerProject, app_ref, parent=None):
         super().__init__(parent)
-        self.project = project
-        self.app     = app_ref
+        self.project    = project
+        self.app        = app_ref
+        self._ds_worker = None
         self._build()
 
     def _build(self):
@@ -2296,9 +2303,9 @@ class OptWorker(QThread):
             try:
                 res = differential_evolution(
                     neg_desirability, bounds,
-                    seed=seed, maxiter=500, tol=1e-8,
-                    popsize=20, mutation=(0.5, 1.5), recombination=0.9,
-                    workers=1)
+                    seed=seed, maxiter=200, tol=1e-6,
+                    popsize=12, mutation=(0.5, 1.5), recombination=0.9,
+                    workers=1, polish=True)
                 if res.success or res.fun < 0:
                     d_score = -res.fun
                     preds = {}
@@ -2559,9 +2566,9 @@ class Tab5_Optimization(QWidget):
         specs = self._collect_specs()
         self.btn_opt.setEnabled(False)
         self.btn_opt.setText("⏳ Optimize ediliyor...")
-        self.status_lbl.setText("Optimizasyon çalışıyor...")
-        self.app.status_bar.showMessage("Diferansiyel evrim optimizasyonu çalışıyor...")
-        QApplication.processEvents()
+        self.status_lbl.setText("Optimizasyon çalışıyor — lütfen bekleyin...")
+        self.app.status_bar.showMessage(
+            "Diferansiyel evrim optimizasyonu çalışıyor... (30-60 sn sürebilir)")
 
         self._worker = OptWorker(self.project, specs)
         self._worker.finished.connect(self._on_opt_done)
@@ -2797,13 +2804,49 @@ class Tab5_Optimization(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 # SEKME 6 — DESIGN SPACE (ICH Q8)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+class DesignSpaceWorker(QThread):
+    """Design Space ızgara hesabını arka planda çalıştırır."""
+    finished = pyqtSignal(object, object, dict, int, str)  # XX, YY, grids, n, mode
+    error    = pyqtSignal(str)
+
+    def __init__(self, tab, xi, yi, n, mode):
+        super().__init__()
+        self.tab  = tab
+        self.xi   = xi
+        self.yi   = yi
+        self.n    = n
+        self.mode = mode
+
+    def run(self):
+        try:
+            p      = self.tab.project
+            active = [r for r in p.responses
+                      if r in p.model_results and r in p.spec_limits]
+            if not active:
+                self.error.emit("Hiçbir yanıt için model + spesifikasyon bulunamadı.")
+                return
+
+            grids = {}
+            for resp_key in active:
+                XX, YY, ZZ = self.tab._predict_grid(
+                    resp_key, self.xi, self.yi, self.n)
+                grids[resp_key] = ZZ
+
+            self.finished.emit(XX, YY, grids, self.n, self.mode)
+        except Exception as e:
+            import traceback
+            write_log(f"DesignSpaceWorker hata:\n{traceback.format_exc()}")
+            self.error.emit(str(e))
+
 class Tab6_DesignSpace(QWidget):
     """ICH Q8 uyumlu Design Space haritası — tüm CQA spec içi bölge."""
 
     def __init__(self, project: OptimizerProject, app_ref, parent=None):
         super().__init__(parent)
-        self.project = project
-        self.app     = app_ref
+        self.project    = project
+        self.app        = app_ref
+        self._ds_worker = None
         self._build()
 
     def _build(self):
@@ -2865,11 +2908,32 @@ class Tab6_DesignSpace(QWidget):
         self._slider_widgets = {}
         outer.addWidget(self.slider_card)
 
-        # ── Ana grafik ────────────────────────────────────────────────────────
+        # ── Ana grafik (sekmeli) ──────────────────────────────────────────────
+        self.graph_tabs = QTabWidget()
+        self.graph_tabs.setStyleSheet(
+            f"QTabBar::tab {{ padding:4px 12px; font-size:11px; }}")
+
+        # Sekme 1: Design Space haritası
+        map_w = QWidget()
+        map_l = QVBoxLayout(map_w)
+        map_l.setContentsMargins(0,0,0,0)
         self.fig = Figure(figsize=(14, 6), facecolor=BG2)
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setStyleSheet(f"background:{BG2};")
-        outer.addWidget(self.canvas, 1)
+        map_l.addWidget(self.canvas)
+        self.graph_tabs.addTab(map_w, "🗺  Design Space Haritası")
+
+        # Sekme 2: 3D Faktör Uzayı (3+ faktörde dolu olacak)
+        self.scatter3d_w = QWidget()
+        s3d_l = QVBoxLayout(self.scatter3d_w)
+        s3d_l.setContentsMargins(0,0,0,0)
+        self.fig3d = Figure(figsize=(14, 6), facecolor=BG2)
+        self.canvas3d = FigureCanvas(self.fig3d)
+        self.canvas3d.setStyleSheet(f"background:{BG2};")
+        s3d_l.addWidget(self.canvas3d)
+        self.graph_tabs.addTab(self.scatter3d_w, "🔵  3D Faktör Uzayı")
+
+        outer.addWidget(self.graph_tabs, 1)
 
         # ── Alt çubuk ────────────────────────────────────────────────────────
         bot = QHBoxLayout()
@@ -3043,21 +3107,16 @@ class Tab6_DesignSpace(QWidget):
 
         self.btn_plot.setEnabled(False)
         self.btn_plot.setText("⏳ Hesaplanıyor...")
-        self.app.status_bar.showMessage("Design Space hesaplanıyor...")
-        QApplication.processEvents()
+        self.app.status_bar.showMessage(
+            "Design Space hesaplanıyor — lütfen bekleyin...")
 
-        try:
-            n    = self.res_spin.value()
-            mode = self.mode_combo.currentText()
-            self._compute_and_draw(xi, yi, n, mode)
-            self.app.status_bar.showMessage("Design Space hazır.", 4000)
-        except Exception as e:
-            import traceback
-            write_log(f"Design Space hata:\n{traceback.format_exc()}")
-            QMessageBox.critical(self, "Hata", f"Harita çizilemedi:\n{e}")
-        finally:
-            self.btn_plot.setEnabled(True)
-            self.btn_plot.setText("▶  Harita Çiz")
+        n    = self.res_spin.value()
+        mode = self.mode_combo.currentText()
+
+        self._ds_worker = DesignSpaceWorker(self, xi, yi, n, mode)
+        self._ds_worker.finished.connect(self._on_ds_done)
+        self._ds_worker.error.connect(self._on_ds_error)
+        self._ds_worker.start()
 
     def _compute_and_draw(self, xi, yi, n, mode):
         p = self.project
@@ -3322,6 +3381,162 @@ class Tab6_DesignSpace(QWidget):
             ax.scatter(xs, ys, c="white", s=25, zorder=4,
                        edgecolors="#4a7ab0", linewidths=0.8,
                        alpha=0.85, label="Ölçüm noktaları")
+
+    def _on_ds_done(self, XX, YY, grids, n, mode):
+        """Worker tamamlandığında UI'ı güncelle."""
+        try:
+            self.fig.clear()
+            self.fig.patch.set_facecolor(BG2)
+            xi = self.x_combo.currentData()
+            yi = self.y_combo.currentData()
+
+            if mode == "Tek CQA seç":
+                self._draw_single(XX, YY, grids, xi, yi,
+                                  list(grids.keys()))
+            elif mode == "CQA sayısı (heatmap)":
+                self._draw_count(XX, YY, grids,
+                                 list(grids.keys()), xi, yi)
+            else:
+                self._draw_and(XX, YY, grids,
+                               list(grids.keys()), xi, yi)
+
+            self.fig.tight_layout(pad=2.0)
+            self.canvas.draw()
+
+            # Durum bilgisi
+            fx = self.project.factors[xi]
+            fy = self.project.factors[yi]
+            if mode == "Tüm CQA (AND)":
+                specs = self.project.spec_limits
+                fail_count = np.zeros((n, n), dtype=int)
+                for resp_key, ZZ in grids.items():
+                    spec = specs.get(resp_key, {})
+                    for r in range(n):
+                        for c in range(n):
+                            if not self._check_spec(ZZ[r, c], spec):
+                                fail_count[r, c] += 1
+                pct = 100 * (fail_count == 0).sum() / fail_count.size
+                self.status_lbl.setText(
+                    f"✅  Design Space: Alan %{pct:.1f} spec içinde  |  "
+                    f"{len(grids)} CQA  |  X: {fx['name']}  Y: {fy['name']}")
+            else:
+                self.status_lbl.setText(
+                    f"✅  Harita hazır  |  {len(grids)} CQA  |  "
+                    f"X: {fx['name']}  Y: {fy['name']}")
+
+            self.app.status_bar.showMessage("Design Space hazır.", 4000)
+
+            # 3D Scatter — 3+ faktörde çiz
+            if len(self.project.factors) >= 3:
+                self._draw_3d_scatter(grids, xi, yi)
+        except Exception as e:
+            import traceback
+            write_log(f"_on_ds_done hata:\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "Hata", f"Grafik çizilemedi:\n{e}")
+        finally:
+            self.btn_plot.setEnabled(True)
+            self.btn_plot.setText("▶  Harita Çiz")
+
+    def _on_ds_error(self, msg):
+        """Worker hata verdiğinde."""
+        self.btn_plot.setEnabled(True)
+        self.btn_plot.setText("▶  Harita Çiz")
+        QMessageBox.critical(self, "Hata", f"Design Space hesaplanamadı:\n{msg}")
+        self.app.status_bar.showMessage("Hata oluştu.", 4000)
+
+    def _draw_3d_scatter(self, grids, xi, yi):
+        """3D faktör uzayı scatter — run noktaları yeşil/kırmızı/sarı."""
+        from mpl_toolkits.mplot3d import Axes3D
+        p = self.project
+        factors = p.factors
+        specs   = p.spec_limits
+        n_f     = len(factors)
+        dm      = p.design_matrix
+        if dm is None:
+            return
+
+        self.fig3d.clear()
+        self.fig3d.patch.set_facecolor(BG2)
+        ax = self.fig3d.add_subplot(111, projection='3d')
+        ax.set_facecolor(BG3)
+        ax.tick_params(colors=TXT2, labelsize=7)
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        ax.xaxis.pane.set_edgecolor("#2a4060")
+        ax.yaxis.pane.set_edgecolor("#2a4060")
+        ax.zaxis.pane.set_edgecolor("#2a4060")
+
+        # 3. faktör indeksi (xi ve yi dışında ilk faktör)
+        zi = next((i for i in range(n_f) if i not in (xi, yi)), 0)
+
+        fx = factors[xi]; fy = factors[yi]; fz = factors[zi]
+        xs_ok, ys_ok, zs_ok = [], [], []
+        xs_fail, ys_fail, zs_fail = [], [], []
+        xs_miss, ys_miss, zs_miss = [], [], []
+
+        for ri in range(len(dm)):
+            xv = float(dm.iloc[ri][fx["name"]])
+            yv = float(dm.iloc[ri][fy["name"]])
+            zv = float(dm.iloc[ri][fz["name"]])
+            run_data = p.run_results.get(ri, {})
+
+            if not run_data:
+                xs_miss.append(xv); ys_miss.append(yv); zs_miss.append(zv)
+                continue
+
+            all_ok = True
+            for resp_key, spec in specs.items():
+                pred_val = run_data.get(resp_key)
+                if pred_val is not None:
+                    if not self._check_spec(float(pred_val), spec):
+                        all_ok = False
+                        break
+
+            if all_ok:
+                xs_ok.append(xv); ys_ok.append(yv); zs_ok.append(zv)
+            else:
+                xs_fail.append(xv); ys_fail.append(yv); zs_fail.append(zv)
+
+        # Çiz
+        if xs_ok:
+            ax.scatter(xs_ok, ys_ok, zs_ok, c=GREEN, s=60,
+                       alpha=0.9, edgecolors="white", linewidths=0.5,
+                       label="Spec içi ✅", zorder=5)
+        if xs_fail:
+            ax.scatter(xs_fail, ys_fail, zs_fail, c=RED, s=60,
+                       alpha=0.9, edgecolors="white", linewidths=0.5,
+                       label="Spec dışı ✗", zorder=5)
+        if xs_miss:
+            ax.scatter(xs_miss, ys_miss, zs_miss, c=TXT2, s=40,
+                       alpha=0.5, edgecolors="#2a4060", linewidths=0.4,
+                       label="Veri yok", zorder=3)
+
+        # Optimum nokta
+        if p.opt_solutions:
+            best = p.opt_solutions[0]
+            ox = best["factors"].get(fx["name"])
+            oy = best["factors"].get(fy["name"])
+            oz = best["factors"].get(fz["name"])
+            if all(v is not None for v in [ox, oy, oz]):
+                ax.scatter([ox], [oy], [oz], c=GOLD, s=200,
+                           marker="*", zorder=6,
+                           edgecolors="white", linewidths=0.8,
+                           label=f"Optimum (D={best['desirability']:.3f})")
+
+        ax.set_xlabel(fx["name"] + (f" ({fx['unit']})" if fx.get("unit") else ""),
+                      color=TXT2, fontsize=8)
+        ax.set_ylabel(fy["name"] + (f" ({fy['unit']})" if fy.get("unit") else ""),
+                      color=TXT2, fontsize=8)
+        ax.set_zlabel(fz["name"] + (f" ({fz['unit']})" if fz.get("unit") else ""),
+                      color=TXT2, fontsize=8)
+        ax.set_title("3D Faktör Uzayı — Run Noktaları", color=GOLD, fontsize=10)
+
+        legend = ax.legend(fontsize=8, labelcolor=TXT,
+                           facecolor=BG2, edgecolor="#2a4060",
+                           loc="upper left")
+        self.fig3d.tight_layout(pad=1.5)
+        self.canvas3d.draw()
 
 
 
