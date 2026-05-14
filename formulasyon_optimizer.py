@@ -2795,6 +2795,537 @@ class Tab5_Optimization(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SEKME 6 — DESIGN SPACE (ICH Q8)
+# ═══════════════════════════════════════════════════════════════════════════════
+class Tab6_DesignSpace(QWidget):
+    """ICH Q8 uyumlu Design Space haritası — tüm CQA spec içi bölge."""
+
+    def __init__(self, project: OptimizerProject, app_ref, parent=None):
+        super().__init__(parent)
+        self.project = project
+        self.app     = app_ref
+        self._build()
+
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+
+        # ── Kontrol çubuğu ────────────────────────────────────────────────────
+        ctrl = card_frame()
+        cl = QHBoxLayout(ctrl)
+        cl.setContentsMargins(14, 8, 14, 8)
+        cl.setSpacing(14)
+
+        cl.addWidget(QLabel("X Ekseni:"))
+        self.x_combo = QComboBox(); self.x_combo.setFixedHeight(28)
+        cl.addWidget(self.x_combo)
+
+        cl.addWidget(QLabel("Y Ekseni:"))
+        self.y_combo = QComboBox(); self.y_combo.setFixedHeight(28)
+        cl.addWidget(self.y_combo)
+
+        cl.addWidget(QLabel("Çözünürlük:"))
+        self.res_spin = QSpinBox()
+        self.res_spin.setRange(20, 120); self.res_spin.setValue(60)
+        self.res_spin.setFixedWidth(65); self.res_spin.setFixedHeight(28)
+        cl.addWidget(self.res_spin)
+
+        # Görüntüleme modu
+        cl.addWidget(QLabel("Mod:"))
+        self.mode_combo = QComboBox(); self.mode_combo.setFixedHeight(28)
+        self.mode_combo.addItems([
+            "Tüm CQA (AND)",
+            "CQA sayısı (heatmap)",
+            "Tek CQA seç",
+        ])
+        self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
+        cl.addWidget(self.mode_combo)
+
+        self.single_resp_combo = QComboBox()
+        self.single_resp_combo.setFixedHeight(28)
+        self.single_resp_combo.setVisible(False)
+        cl.addWidget(self.single_resp_combo)
+
+        cl.addStretch()
+
+        self.btn_plot = make_btn("▶  Harita Çiz", "rgba(20,80,20,0.9)", 32)
+        self.btn_plot.setStyleSheet(self.btn_plot.styleSheet() +
+                                    "font-size:12px; font-weight:bold;")
+        self.btn_plot.clicked.connect(self._plot)
+        cl.addWidget(self.btn_plot)
+        outer.addWidget(ctrl)
+
+        # ── Sabit faktör slider'ları ───────────────────────────────────────────
+        self.slider_card = card_frame()
+        self.slider_layout = QHBoxLayout(self.slider_card)
+        self.slider_layout.setContentsMargins(14, 8, 14, 8)
+        self.slider_layout.setSpacing(20)
+        self.slider_card.setFixedHeight(70)
+        self._slider_widgets = {}
+        outer.addWidget(self.slider_card)
+
+        # ── Ana grafik ────────────────────────────────────────────────────────
+        self.fig = Figure(figsize=(14, 6), facecolor=BG2)
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setStyleSheet(f"background:{BG2};")
+        outer.addWidget(self.canvas, 1)
+
+        # ── Alt çubuk ────────────────────────────────────────────────────────
+        bot = QHBoxLayout()
+        self.status_lbl = QLabel(
+            "Model ve spesifikasyon sınırları tanımlandıktan sonra harita çizebilirsiniz.")
+        self.status_lbl.setStyleSheet(
+            f"color:{TXT2}; font-size:11px; background:transparent;")
+        bot.addWidget(self.status_lbl)
+        bot.addStretch()
+        self.btn_next = make_btn("Doğrulama  ▶", "rgba(20,80,20,0.8)", 34)
+        self.btn_next.setStyleSheet(self.btn_next.styleSheet() +
+                                    "font-size:12px; font-weight:bold;")
+        self.btn_next.clicked.connect(lambda: self.app.tabs.setCurrentIndex(6))
+        bot.addWidget(self.btn_next)
+        outer.addLayout(bot)
+
+        self.x_combo.currentTextChanged.connect(self._on_axis_changed)
+        self.y_combo.currentTextChanged.connect(self._on_axis_changed)
+
+    # ── Public ───────────────────────────────────────────────────────────────
+    def refresh(self):
+        if not self.project.model_results:
+            return
+        self._populate_combos()
+
+    # ── İç metodlar ──────────────────────────────────────────────────────────
+    def _populate_combos(self):
+        self.x_combo.blockSignals(True)
+        self.y_combo.blockSignals(True)
+        self.single_resp_combo.blockSignals(True)
+
+        self.x_combo.clear(); self.y_combo.clear()
+        for i, f in enumerate(self.project.factors):
+            label = f"{f['name']}" + (f" ({f['unit']})" if f.get("unit") else "")
+            self.x_combo.addItem(label, i)
+            self.y_combo.addItem(label, i)
+        if self.y_combo.count() >= 2:
+            self.y_combo.setCurrentIndex(1)
+
+        self.single_resp_combo.clear()
+        for r in self.project.responses:
+            if r in self.project.model_results:
+                self.single_resp_combo.addItem(RESPONSE_LABELS.get(r, r), r)
+
+        self.x_combo.blockSignals(False)
+        self.y_combo.blockSignals(False)
+        self.single_resp_combo.blockSignals(False)
+        self._build_sliders()
+
+    def _on_mode_changed(self, mode):
+        self.single_resp_combo.setVisible("Tek CQA" in mode)
+
+    def _on_axis_changed(self):
+        self._build_sliders()
+
+    def _build_sliders(self):
+        while self.slider_layout.count():
+            item = self.slider_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._slider_widgets = {}
+
+        xi = self.x_combo.currentData() or 0
+        yi = self.y_combo.currentData() or 1
+
+        for i, f in enumerate(self.project.factors):
+            if i in (xi, yi):
+                continue
+            mid = f.get("mid", (f["low"] + f["high"]) / 2)
+            grp = QGroupBox(f["name"])
+            grp.setFixedWidth(150)
+            gl = QVBoxLayout(grp)
+            gl.setContentsMargins(6, 4, 6, 4)
+            sp = QDoubleSpinBox()
+            sp.setRange(f["low"], f["high"])
+            sp.setValue(mid)
+            sp.setDecimals(3)
+            sp.setSingleStep((f["high"] - f["low"]) / 20)
+            sp.setFixedHeight(26)
+            if f.get("unit"):
+                sp.setSuffix(f"  {f['unit']}")
+            gl.addWidget(sp)
+            self.slider_layout.addWidget(grp)
+            self._slider_widgets[i] = sp
+        self.slider_layout.addStretch()
+
+    def _get_fixed(self):
+        return {i: sp.value() for i, sp in self._slider_widgets.items()}
+
+    def _encode(self, val, f):
+        lo, hi = f["low"], f["high"]
+        mid = f.get("mid", (lo + hi) / 2)
+        if hi == lo: return 0.0
+        if val <= mid and (mid - lo) != 0:
+            return (val - lo) / (mid - lo) - 1
+        elif (hi - mid) != 0:
+            return (val - mid) / (hi - mid)
+        return 0.0
+
+    def _predict_grid(self, resp_key, xi, yi, n):
+        import statsmodels.api as _sm
+        p = self.project
+        safe = p.get_safe_names()
+        factors = p.factors
+        n_factors = len(factors)
+        res = p.model_results[resp_key]
+        model = res["model"]
+
+        fx = factors[xi]; fy = factors[yi]
+        x_arr = np.linspace(fx["low"], fx["high"], n)
+        y_arr = np.linspace(fy["low"], fy["high"], n)
+        XX, YY = np.meshgrid(x_arr, y_arr)
+        ZZ = np.full_like(XX, np.nan)
+
+        fixed = self._get_fixed()
+        param_idx = model.params.index
+
+        for r in range(n):
+            for c in range(n):
+                row = {}
+                for k, f in enumerate(factors):
+                    if k == xi:
+                        row[safe[k]] = self._encode(XX[r, c], f)
+                    elif k == yi:
+                        row[safe[k]] = self._encode(YY[r, c], f)
+                    else:
+                        row[safe[k]] = self._encode(
+                            fixed.get(k, f.get("mid", (f["low"]+f["high"])/2)), f)
+                for name in safe:
+                    row[f"{name}_sq"] = row[name] ** 2
+                for a in range(n_factors):
+                    for b in range(a+1, n_factors):
+                        row[f"{safe[a]}_x_{safe[b]}"] = row[safe[a]] * row[safe[b]]
+
+                df_row = pd.DataFrame([row])
+                row_mat = _sm.add_constant(df_row, has_constant="add")
+                for col in param_idx:
+                    if col not in row_mat.columns:
+                        row_mat[col] = 0.0
+                row_mat = row_mat.reindex(columns=param_idx, fill_value=0.0)
+                try:
+                    ZZ[r, c] = float(model.predict(row_mat)[0])
+                except Exception:
+                    pass
+
+        return XX, YY, ZZ
+
+    def _check_spec(self, val, spec):
+        """Tek bir değerin spec içinde olup olmadığını kontrol et."""
+        if val is None or np.isnan(val):
+            return False
+        lsl = spec.get("lsl"); usl = spec.get("usl")
+        if lsl is not None and val < lsl: return False
+        if usl is not None and val > usl: return False
+        return True
+
+    def _plot(self):
+        if not self.project.model_results:
+            QMessageBox.warning(self, "", "Önce Model sekmesinden model kurun.")
+            return
+        if not self.project.spec_limits:
+            QMessageBox.warning(self, "",
+                "Önce Optimizasyon sekmesinden spesifikasyon sınırlarını tanımlayın.")
+            return
+
+        xi = self.x_combo.currentData()
+        yi = self.y_combo.currentData()
+        if xi is None or yi is None or xi == yi:
+            QMessageBox.warning(self, "", "X ve Y farklı faktörler olmalıdır.")
+            return
+
+        self.btn_plot.setEnabled(False)
+        self.btn_plot.setText("⏳ Hesaplanıyor...")
+        self.app.status_bar.showMessage("Design Space hesaplanıyor...")
+        QApplication.processEvents()
+
+        try:
+            n    = self.res_spin.value()
+            mode = self.mode_combo.currentText()
+            self._compute_and_draw(xi, yi, n, mode)
+            self.app.status_bar.showMessage("Design Space hazır.", 4000)
+        except Exception as e:
+            import traceback
+            write_log(f"Design Space hata:\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "Hata", f"Harita çizilemedi:\n{e}")
+        finally:
+            self.btn_plot.setEnabled(True)
+            self.btn_plot.setText("▶  Harita Çiz")
+
+    def _compute_and_draw(self, xi, yi, n, mode):
+        p = self.project
+        factors = p.factors
+        fx = factors[xi]; fy = factors[yi]
+        specs = p.spec_limits
+
+        # Aktif yanıtlar (hem model hem spec tanımlı)
+        active = [r for r in p.responses
+                  if r in p.model_results and r in specs]
+
+        if not active:
+            QMessageBox.warning(self, "",
+                "Hiçbir yanıt için model + spesifikasyon bulunamadı.")
+            return
+
+        # Her aktif yanıt için grid tahmin
+        grids = {}
+        for resp_key in active:
+            self.app.status_bar.showMessage(
+                f"Hesaplanıyor: {RESPONSE_LABELS.get(resp_key, resp_key)}...")
+            QApplication.processEvents()
+            XX, YY, ZZ = self._predict_grid(resp_key, xi, yi, n)
+            grids[resp_key] = ZZ
+
+        self.fig.clear()
+        self.fig.patch.set_facecolor(BG2)
+
+        if mode == "Tek CQA seç":
+            self._draw_single(XX, YY, grids, xi, yi, active)
+        elif mode == "CQA sayısı (heatmap)":
+            self._draw_count(XX, YY, grids, active, xi, yi)
+        else:  # Tüm CQA (AND)
+            self._draw_and(XX, YY, grids, active, xi, yi)
+
+        self.fig.tight_layout(pad=2.0)
+        self.canvas.draw()
+
+        # Durum bilgisi
+        if mode == "Tüm CQA (AND)":
+            and_mask = np.ones_like(XX, dtype=bool)
+            for resp_key, ZZ in grids.items():
+                spec = specs[resp_key]
+                for r in range(n):
+                    for c in range(n):
+                        if not self._check_spec(ZZ[r, c], spec):
+                            and_mask[r, c] = False
+            pct = 100 * and_mask.sum() / and_mask.size
+            self.status_lbl.setText(
+                f"✅  Design Space: Alan %{pct:.1f} spec içinde  |  "
+                f"{len(active)} CQA  |  "
+                f"X: {fx['name']}  Y: {fy['name']}")
+        else:
+            self.status_lbl.setText(
+                f"✅  Harita hazır  |  {len(active)} CQA  |  "
+                f"X: {fx['name']}  Y: {fy['name']}")
+
+    def _draw_and(self, XX, YY, grids, active, xi, yi):
+        """Tüm CQA'ların aynı anda spec içinde olduğu bölge — ICH Q8."""
+        p = self.project
+        specs = p.spec_limits
+        n = XX.shape[0]
+
+        # Yeşil=tümü OK, Sarı=1 hariç, Kırmızı=2+ hariç
+        fail_count = np.zeros_like(XX, dtype=int)
+        for resp_key, ZZ in grids.items():
+            spec = specs[resp_key]
+            for r in range(n):
+                for c in range(n):
+                    if not self._check_spec(ZZ[r, c], spec):
+                        fail_count[r, c] += 1
+
+        # Sol: Design Space haritası
+        ax = self.fig.add_subplot(1, 2, 1)
+        ax.set_facecolor(BG3)
+        ax.tick_params(colors=TXT2, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#2a4060")
+
+        import matplotlib.colors as mcolors
+        cmap = mcolors.ListedColormap([
+            "#003300",   # 0 fail = koyu yeşil
+            "#1a5200",   # 1 fail = açık yeşil
+            "#7a5200",   # 2 fail = sarı-kahve
+            "#8b0000",   # 3+ fail = kırmızı
+        ])
+        bounds_c = [-0.5, 0.5, 1.5, 2.5, max(len(active)+0.5, 3.5)]
+        norm = mcolors.BoundaryNorm(bounds_c, cmap.N)
+
+        im = ax.pcolormesh(XX, YY, fail_count, cmap=cmap, norm=norm,
+                           shading="auto", alpha=0.9)
+
+        # Design Space sınırı (0 fail bölgesi kontur çizgisi)
+        try:
+            ds_mask = (fail_count == 0).astype(float)
+            ax.contour(XX, YY, ds_mask, levels=[0.5],
+                       colors=[GOLD], linewidths=2.0)
+        except Exception:
+            pass
+
+        # Optimum nokta
+        self._add_optimum(ax, xi, yi)
+
+        # Gerçek run noktaları
+        self._add_run_points(ax, xi, yi)
+
+        fx = self.project.factors[xi]; fy = self.project.factors[yi]
+        ax.set_xlabel(f"{fx['name']}" + (f" ({fx['unit']})" if fx.get("unit") else ""),
+                      color=TXT2, fontsize=9)
+        ax.set_ylabel(f"{fy['name']}" + (f" ({fy['unit']})" if fy.get("unit") else ""),
+                      color=TXT2, fontsize=9)
+        ax.set_title("Design Space  (ICH Q8)", color=GOLD, fontsize=10)
+
+        cb = self.fig.colorbar(im, ax=ax, ticks=[0, 1, 2, 3])
+        cb.ax.set_yticklabels(["Tümü OK", "1 Hata", "2 Hata", "3+"], fontsize=7)
+        cb.ax.tick_params(colors=TXT2)
+
+        # Sağ: CQA uygunluk özet çubuğu
+        ax2 = self.fig.add_subplot(1, 2, 2)
+        ax2.set_facecolor(BG3)
+        ax2.tick_params(colors=TXT2, labelsize=8)
+        for spine in ax2.spines.values():
+            spine.set_edgecolor("#2a4060")
+
+        labels, ok_pcts = [], []
+        for resp_key, ZZ in grids.items():
+            spec = self.project.spec_limits[resp_key]
+            ok_count = sum(
+                1 for r in range(n) for c in range(n)
+                if self._check_spec(ZZ[r, c], spec))
+            ok_pcts.append(100 * ok_count / (n*n))
+            labels.append(RESPONSE_LABELS.get(resp_key, resp_key))
+
+        colors = [GREEN if v >= 80 else GOLD if v >= 50 else RED for v in ok_pcts]
+        bars = ax2.barh(labels, ok_pcts, color=colors, alpha=0.85,
+                        edgecolor="#2a4060", linewidth=0.8)
+        ax2.set_xlim(0, 105)
+        ax2.axvline(80, color=GOLD, lw=1, linestyle="--", alpha=0.6)
+        ax2.set_xlabel("Spec İçi Alan (%)", color=TXT2, fontsize=8)
+        ax2.set_title("CQA Uygunluk Oranı", color=GOLD, fontsize=10)
+        for bar, val in zip(bars, ok_pcts):
+            ax2.text(val + 1, bar.get_y() + bar.get_height()/2,
+                     f"{val:.1f}%", va="center", color=TXT, fontsize=8)
+
+    def _draw_count(self, XX, YY, grids, active, xi, yi):
+        """Kaç CQA spec içinde — ısı haritası."""
+        p = self.project; specs = p.spec_limits; n = XX.shape[0]
+        ok_count = np.zeros_like(XX, dtype=float)
+        for resp_key, ZZ in grids.items():
+            spec = specs[resp_key]
+            for r in range(n):
+                for c in range(n):
+                    if self._check_spec(ZZ[r, c], spec):
+                        ok_count[r, c] += 1
+
+        ax = self.fig.add_subplot(1, 1, 1)
+        ax.set_facecolor(BG3)
+        ax.tick_params(colors=TXT2, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#2a4060")
+
+        cf = ax.contourf(XX, YY, ok_count,
+                         levels=np.arange(-0.5, len(active)+1.5, 1),
+                         cmap="RdYlGn", alpha=0.9)
+        cb = self.fig.colorbar(cf, ax=ax)
+        cb.ax.tick_params(colors=TXT2, labelsize=7)
+        cb.set_label("Spec İçi CQA Sayısı", color=TXT2, fontsize=8)
+
+        self._add_optimum(ax, xi, yi)
+        self._add_run_points(ax, xi, yi)
+
+        fx = self.project.factors[xi]; fy = self.project.factors[yi]
+        ax.set_xlabel(f"{fx['name']}" + (f" ({fx['unit']})" if fx.get("unit") else ""),
+                      color=TXT2, fontsize=9)
+        ax.set_ylabel(f"{fy['name']}" + (f" ({fy['unit']})" if fy.get("unit") else ""),
+                      color=TXT2, fontsize=9)
+        ax.set_title(f"Spec İçi CQA Sayısı (maks={len(active)})",
+                     color=GOLD, fontsize=10)
+
+    def _draw_single(self, XX, YY, grids, xi, yi, active):
+        """Tek CQA için yüzey + spec sınırı."""
+        resp_key = self.single_resp_combo.currentData()
+        if resp_key is None or resp_key not in grids:
+            resp_key = active[0]
+
+        ZZ   = grids[resp_key]
+        spec = self.project.spec_limits.get(resp_key, {})
+        lsl  = spec.get("lsl"); usl = spec.get("usl")
+        label = RESPONSE_LABELS.get(resp_key, resp_key)
+
+        ax = self.fig.add_subplot(1, 1, 1)
+        ax.set_facecolor(BG3)
+        ax.tick_params(colors=TXT2, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#2a4060")
+
+        cf = ax.contourf(XX, YY, ZZ, levels=25, cmap="viridis", alpha=0.9)
+        cs = ax.contour(XX, YY, ZZ, levels=25, colors="white",
+                        alpha=0.2, linewidths=0.4)
+
+        # Spec sınır konturları
+        if lsl is not None:
+            try:
+                ax.contour(XX, YY, ZZ, levels=[lsl],
+                           colors=["#ff4444"], linewidths=2.0,
+                           linestyles="--")
+                ax.clabel(ax.contour(XX, YY, ZZ, levels=[lsl],
+                                     colors=["#ff4444"]),
+                          fmt=f"LSL={lsl}", fontsize=7, colors="#ff4444")
+            except Exception:
+                pass
+        if usl is not None:
+            try:
+                ax.contour(XX, YY, ZZ, levels=[usl],
+                           colors=["#ff8800"], linewidths=2.0,
+                           linestyles="--")
+            except Exception:
+                pass
+
+        cb = self.fig.colorbar(cf, ax=ax)
+        cb.ax.tick_params(colors=TXT2, labelsize=7)
+        cb.set_label(label, color=TXT2, fontsize=8)
+
+        self._add_optimum(ax, xi, yi)
+        self._add_run_points(ax, xi, yi)
+
+        fx = self.project.factors[xi]; fy = self.project.factors[yi]
+        ax.set_xlabel(f"{fx['name']}" + (f" ({fx['unit']})" if fx.get("unit") else ""),
+                      color=TXT2, fontsize=9)
+        ax.set_ylabel(f"{fy['name']}" + (f" ({fy['unit']})" if fy.get("unit") else ""),
+                      color=TXT2, fontsize=9)
+        ax.set_title(f"{label} — Design Space", color=GOLD, fontsize=10)
+
+    def _add_optimum(self, ax, xi, yi):
+        """Optimum noktayı grafik üzerine ekle."""
+        if not self.project.opt_solutions:
+            return
+        best = self.project.opt_solutions[0]
+        fx = self.project.factors[xi]; fy = self.project.factors[yi]
+        ox = best.get("factors", {}).get(fx["name"])
+        oy = best.get("factors", {}).get(fy["name"])
+        if ox is not None and oy is not None:
+            ax.plot(ox, oy, "*", color=GOLD, markersize=16,
+                    zorder=5, label=f"Optimum (D={best['desirability']:.3f})",
+                    markeredgecolor="white", markeredgewidth=0.8)
+            ax.legend(fontsize=8, labelcolor=TXT2,
+                      facecolor=BG2, edgecolor="#2a4060",
+                      loc="upper right")
+
+    def _add_run_points(self, ax, xi, yi):
+        """Gerçek run noktalarını ekle."""
+        if self.project.design_matrix is None:
+            return
+        df = self.project.design_matrix
+        fx = self.project.factors[xi]; fy = self.project.factors[yi]
+        xs, ys = [], []
+        for ri in range(len(df)):
+            if self.project.run_results.get(ri):
+                xs.append(df.iloc[ri][fx["name"]])
+                ys.append(df.iloc[ri][fy["name"]])
+        if xs:
+            ax.scatter(xs, ys, c="white", s=25, zorder=4,
+                       edgecolors="#4a7ab0", linewidths=0.8,
+                       alpha=0.85, label="Ölçüm noktaları")
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PLACEHOLDER SEKMELER (Adım 5-7 için)
 # ═══════════════════════════════════════════════════════════════════════════════
 class PlaceholderTab(QWidget):
@@ -2926,11 +3457,7 @@ class FormulasyonOptimizerApp(QMainWindow):
         self.tabs.addTab(self.tab5, "5 · Optimizasyon")
 
         # Sekme 6 — Design Space
-        self.tab6 = PlaceholderTab(
-            "Design Space",
-            "ICH Q8 uyumlu tasarım uzayı haritası.\n"
-            "Tüm CQA'ların spec içinde kaldığı faktör bölgesi görselleştirilir.",
-            "🗂")
+        self.tab6 = Tab6_DesignSpace(self.project, self)
         self.tabs.addTab(self.tab6, "6 · Design Space")
 
         # Sekme 7 — Doğrulama
