@@ -2170,6 +2170,631 @@ class Tab4_ResponseSurface(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SEKME 5 — OPTİMİZASYON
+# ═══════════════════════════════════════════════════════════════════════════════
+class OptWorker(QThread):
+    """Derringer-Suich optimizasyonunu arka planda çalıştırır."""
+    finished = pyqtSignal(list, str)   # solutions, error_msg
+
+    def __init__(self, project, spec_limits):
+        super().__init__()
+        self.project     = project
+        self.spec_limits = spec_limits
+
+    def run(self):
+        try:
+            self._run_safe()
+        except Exception as e:
+            import traceback
+            write_log(f"OptWorker crash:\n{traceback.format_exc()}")
+            self.finished.emit([], str(e))
+
+    def _run_safe(self):
+        from scipy.optimize import differential_evolution
+        import statsmodels.api as sm
+
+        p      = self.project
+        safe   = p.get_safe_names()
+        factors = p.factors
+        n_factors = len(factors)
+        specs  = self.spec_limits
+
+        def encode(val, f):
+            lo, hi = f["low"], f["high"]
+            mid = f.get("mid", (lo+hi)/2)
+            if hi == lo: return 0.0
+            if val <= mid and (mid-lo) != 0:
+                return (val-lo)/(mid-lo) - 1
+            elif (hi-mid) != 0:
+                return (val-mid)/(hi-mid)
+            return 0.0
+
+        def predict_resp(resp_key, factor_vals):
+            res = p.model_results.get(resp_key)
+            if res is None:
+                return None
+            model = res["model"]
+            row = {}
+            for i, f in enumerate(factors):
+                row[safe[i]] = encode(factor_vals[i], f)
+            for name in safe:
+                row[f"{name}_sq"] = row[name]**2
+            for a in range(n_factors):
+                for b in range(a+1, n_factors):
+                    row[f"{safe[a]}_x_{safe[b]}"] = row[safe[a]]*row[safe[b]]
+            df_row = pd.DataFrame([row])
+            row_mat = sm.add_constant(df_row, has_constant="add")
+            for col in model.params.index:
+                if col not in row_mat.columns:
+                    row_mat[col] = 0.0
+            row_mat = row_mat.reindex(columns=model.params.index, fill_value=0.0)
+            try:
+                return float(model.predict(row_mat)[0])
+            except Exception:
+                return None
+
+        def derringer_suich(pred, spec):
+            """Gerçek Derringer-Suich desirability fonksiyonu."""
+            goal = spec.get("goal", "target")
+            lsl  = spec.get("lsl")
+            usl  = spec.get("usl")
+            tgt  = spec.get("target")
+            s    = max(0.01, float(spec.get("weight", 1.0)))
+
+            if pred is None or np.isnan(pred):
+                return 0.0
+
+            if goal == "maximize":
+                if lsl is None: return 1.0
+                if pred <= lsl: return 0.0
+                if usl is not None and pred >= usl: return 1.0
+                hi = usl if usl is not None else lsl + abs(lsl)*2 + 1
+                return float(((pred - lsl)/(hi - lsl))**s)
+
+            elif goal == "minimize":
+                if usl is None: return 1.0
+                if pred >= usl: return 0.0
+                if lsl is not None and pred <= lsl: return 1.0
+                lo = lsl if lsl is not None else usl - abs(usl)*2 - 1
+                return float(((usl - pred)/(usl - lo))**s)
+
+            else:  # target
+                if tgt is None:
+                    tgt = ((lsl or 0) + (usl or 0)) / 2
+                if lsl is not None and pred < lsl: return 0.0
+                if usl is not None and pred > usl: return 0.0
+                if pred == tgt: return 1.0
+                if pred < tgt and lsl is not None and tgt > lsl:
+                    return float(((pred - lsl)/(tgt - lsl))**s)
+                if pred > tgt and usl is not None and usl > tgt:
+                    return float(((usl - pred)/(usl - tgt))**s)
+                return 1.0
+
+        active_resps = [r for r in p.responses
+                        if r in p.model_results and r in specs]
+
+        def neg_desirability(x):
+            if not active_resps:
+                return 0.0
+            ds = []
+            for resp_key in active_resps:
+                pred = predict_resp(resp_key, x)
+                d    = derringer_suich(pred, specs[resp_key])
+                ds.append(d)
+            # Geometrik ortalama
+            prod = 1.0
+            for d in ds:
+                prod *= max(d, 1e-10)
+            return -float(prod ** (1.0/len(ds)))
+
+        bounds = [(f["low"], f["high"]) for f in factors]
+
+        # differential_evolution — çoklu başlangıç noktası
+        solutions = []
+        seeds = [42, 7, 123, 999, 31]
+        for seed in seeds:
+            try:
+                res = differential_evolution(
+                    neg_desirability, bounds,
+                    seed=seed, maxiter=500, tol=1e-8,
+                    popsize=20, mutation=(0.5, 1.5), recombination=0.9,
+                    workers=1)
+                if res.success or res.fun < 0:
+                    d_score = -res.fun
+                    preds = {}
+                    for resp_key in p.responses:
+                        if resp_key in p.model_results:
+                            pv = predict_resp(resp_key, res.x)
+                            preds[resp_key] = pv
+                    factor_dict = {f["name"]: float(res.x[i])
+                                   for i, f in enumerate(factors)}
+                    solutions.append({
+                        "desirability": round(d_score, 6),
+                        "factors":      factor_dict,
+                        "predictions":  preds,
+                        "x":            list(res.x),
+                    })
+            except Exception:
+                pass
+
+        # Tekrarları ve benzer noktaları filtrele
+        unique = []
+        for s in sorted(solutions, key=lambda x: -x["desirability"]):
+            is_dup = False
+            for u in unique:
+                dist = np.sqrt(sum((s["x"][i]-u["x"][i])**2
+                                   for i in range(len(s["x"]))))
+                span = np.sqrt(sum((f["high"]-f["low"])**2
+                                   for f in factors)) or 1
+                if dist/span < 0.05:
+                    is_dup = True
+                    break
+            if not is_dup:
+                unique.append(s)
+            if len(unique) >= 5:
+                break
+
+        self.finished.emit(unique, "")
+
+
+class Tab5_Optimization(QWidget):
+    """Sekme 5 — Derringer-Suich optimizasyon, USL/LSL, Top-5 çözüm."""
+
+    def __init__(self, project: OptimizerProject, app_ref, parent=None):
+        super().__init__(parent)
+        self.project    = project
+        self.app        = app_ref
+        self._worker    = None
+        self._spec_rows = {}   # {resp_key: widget_dict}
+        self._build()
+
+    def _build(self):
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(12)
+
+        # ── Sol: Spesifikasyon tanımı ─────────────────────────────────────────
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        left.addWidget(section_label("🎯  CQA Hedefleri & Spesifikasyon Sınırları"))
+
+        hint = info_label(
+            "Her yanıt için hedef tipi, LSL/USL sınırları ve ağırlık (s) tanımlayın. "
+            "s=1 lineer, s<1 daha toleranslı, s>1 daha katı. "
+            "Boş bırakılan sınırlar göz ardı edilir.")
+        left.addWidget(hint)
+
+        # Spec tablosu başlıkları
+        hdr = QWidget(); hdr.setStyleSheet("background:transparent;")
+        hl  = QHBoxLayout(hdr); hl.setContentsMargins(0,0,0,0); hl.setSpacing(4)
+        for txt, w in [("Yanıt", 130), ("Hedef", 90), ("LSL", 72),
+                       ("USL", 72), ("Hedef Değer", 80), ("Ağırlık s", 72)]:
+            l = QLabel(txt)
+            l.setFixedWidth(w)
+            l.setStyleSheet(f"color:{GOLD}; font-size:10px; font-weight:bold; background:transparent;")
+            hl.addWidget(l)
+        left.addWidget(hdr)
+
+        # Spec satırları scroll alanı
+        self.spec_scroll = QScrollArea()
+        self.spec_scroll.setWidgetResizable(True)
+        self.spec_scroll.setFixedHeight(280)
+        self.spec_scroll.setStyleSheet("border:none; background:transparent;")
+        self.spec_container = QWidget()
+        self.spec_container.setStyleSheet("background:transparent;")
+        self.spec_vlay = QVBoxLayout(self.spec_container)
+        self.spec_vlay.setSpacing(4)
+        self.spec_vlay.setContentsMargins(0,0,0,0)
+        self.spec_vlay.addStretch()
+        self.spec_scroll.setWidget(self.spec_container)
+        left.addWidget(self.spec_scroll)
+
+        # Optimize butonu
+        self.btn_opt = make_btn("▶  Optimize Et", "rgba(20,80,20,0.9)", 42)
+        self.btn_opt.setStyleSheet(self.btn_opt.styleSheet() +
+                                   "font-size:14px; font-weight:bold;")
+        self.btn_opt.clicked.connect(self._run_optimization)
+        left.addWidget(self.btn_opt)
+
+        # Robustluk özeti
+        left.addWidget(section_label("🔩  Robustluk Özeti (Optimum ±10%)"))
+        self.robust_table = QTableWidget()
+        self.robust_table.setColumnCount(4)
+        self.robust_table.setHorizontalHeaderLabels(
+            ["Yanıt", "Optimum", "-10%", "+10%"])
+        self.robust_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self.robust_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.robust_table.setFixedHeight(180)
+        left.addWidget(self.robust_table)
+
+        left.addStretch()
+
+        left_w = QWidget(); left_w.setLayout(left)
+        left_w.setMinimumWidth(500); left_w.setMaximumWidth(560)
+
+        # ── Sağ: Top-5 sonuçlar ───────────────────────────────────────────────
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        right.addWidget(section_label("🏆  Top-5 Optimum Formülasyon"))
+
+        self.result_tabs = QTabWidget()
+        self.result_tabs.setStyleSheet(f"""
+            QTabBar::tab {{ padding: 5px 12px; font-size: 11px; }}
+        """)
+        right.addWidget(self.result_tabs, 1)
+
+        # Desirability grafiği
+        right.addWidget(section_label("📊  Desirability Skoru"))
+        self.fig_d = Figure(figsize=(8, 2.2), facecolor=BG2)
+        self.canvas_d = FigureCanvas(self.fig_d)
+        self.canvas_d.setFixedHeight(160)
+        self.canvas_d.setStyleSheet(f"background:{BG2};")
+        right.addWidget(self.canvas_d)
+
+        # Alt buton
+        bot = QHBoxLayout()
+        self.status_lbl = QLabel("Model kurulduktan sonra optimize edebilirsiniz.")
+        self.status_lbl.setStyleSheet(
+            f"color:{TXT2}; font-size:11px; background:transparent;")
+        bot.addWidget(self.status_lbl)
+        bot.addStretch()
+        self.btn_next = make_btn("Design Space  ▶", "rgba(20,80,20,0.8)", 34)
+        self.btn_next.setStyleSheet(self.btn_next.styleSheet() +
+                                    "font-size:12px; font-weight:bold;")
+        self.btn_next.clicked.connect(lambda: self.app.tabs.setCurrentIndex(5))
+        bot.addWidget(self.btn_next)
+        right.addLayout(bot)
+
+        right_w = QWidget(); right_w.setLayout(right)
+
+        outer.addWidget(left_w)
+        outer.addWidget(right_w, 1)
+
+    # ── Public ───────────────────────────────────────────────────────────────
+    def refresh(self):
+        if not self.project.model_results:
+            return
+        self._build_spec_rows()
+        if self.project.opt_solutions:
+            self._show_solutions(self.project.opt_solutions)
+
+    # ── Spec satırları ────────────────────────────────────────────────────────
+    def _build_spec_rows(self):
+        while self.spec_vlay.count() > 1:
+            item = self.spec_vlay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._spec_rows = {}
+
+        GOAL_OPTS = ["maximize", "minimize", "target"]
+        GOAL_DEFAULTS = {
+            "mmad":     ("target",   "2.5", "3.5", "3.0"),
+            "gsd":      ("minimize", "1.0", "2.5", ""),
+            "fpd_5um":  ("maximize", "0.5", "",    ""),
+            "fpf_5um":  ("maximize", "35",  "",    ""),
+            "fpd_3um":  ("maximize", "0.3", "",    ""),
+            "fpf_3um":  ("maximize", "25",  "",    ""),
+            "fpd_15um": ("maximize", "0.1", "",    ""),
+            "fpf_15um": ("maximize", "15",  "",    ""),
+            "metered":  ("target",   "0.9", "1.1", "1.0"),
+            "delivered":("maximize", "0.8", "",    ""),
+        }
+
+        for resp_key in self.project.responses:
+            if resp_key not in self.project.model_results:
+                continue
+            label = RESPONSE_LABELS.get(resp_key, resp_key)
+            defs  = GOAL_DEFAULTS.get(resp_key, ("target", "", "", ""))
+
+            row_w = QWidget(); row_w.setStyleSheet("background:transparent;")
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(0,2,0,2); row_l.setSpacing(4)
+
+            # İsim
+            nm = QLabel(label)
+            nm.setFixedWidth(130)
+            nm.setStyleSheet(f"color:{TXT}; font-size:11px; background:transparent;")
+            row_l.addWidget(nm)
+
+            # Hedef combo
+            goal_cb = QComboBox(); goal_cb.setFixedWidth(90); goal_cb.setFixedHeight(26)
+            goal_cb.addItems(GOAL_OPTS)
+            goal_cb.setCurrentText(defs[0])
+            row_l.addWidget(goal_cb)
+
+            # LSL
+            lsl_e = QLineEdit(defs[1]); lsl_e.setFixedWidth(72); lsl_e.setFixedHeight(26)
+            lsl_e.setPlaceholderText("LSL")
+            row_l.addWidget(lsl_e)
+
+            # USL
+            usl_e = QLineEdit(defs[2]); usl_e.setFixedWidth(72); usl_e.setFixedHeight(26)
+            usl_e.setPlaceholderText("USL")
+            row_l.addWidget(usl_e)
+
+            # Hedef değer
+            tgt_e = QLineEdit(defs[3]); tgt_e.setFixedWidth(80); tgt_e.setFixedHeight(26)
+            tgt_e.setPlaceholderText("Hedef")
+            row_l.addWidget(tgt_e)
+
+            # Ağırlık s
+            s_sp = QDoubleSpinBox()
+            s_sp.setRange(0.1, 5.0); s_sp.setValue(1.0); s_sp.setDecimals(1)
+            s_sp.setSingleStep(0.1); s_sp.setFixedWidth(72); s_sp.setFixedHeight(26)
+            row_l.addWidget(s_sp)
+
+            self.spec_vlay.insertWidget(self.spec_vlay.count()-1, row_w)
+            self._spec_rows[resp_key] = {
+                "goal": goal_cb, "lsl": lsl_e,
+                "usl": usl_e, "target": tgt_e, "weight": s_sp,
+            }
+
+    def _collect_specs(self):
+        specs = {}
+        for resp_key, widgets in self._spec_rows.items():
+            def safe_float(txt):
+                try: return float(txt.strip().replace(",", "."))
+                except: return None
+            specs[resp_key] = {
+                "goal":   widgets["goal"].currentText(),
+                "lsl":    safe_float(widgets["lsl"].text()),
+                "usl":    safe_float(widgets["usl"].text()),
+                "target": safe_float(widgets["target"].text()),
+                "weight": widgets["weight"].value(),
+            }
+            self.project.spec_limits[resp_key] = specs[resp_key]
+        return specs
+
+    # ── Optimizasyon ─────────────────────────────────────────────────────────
+    def _run_optimization(self):
+        if not self.project.model_results:
+            QMessageBox.warning(self, "", "Önce Model sekmesinden model kurun.")
+            return
+        if not self._spec_rows:
+            QMessageBox.warning(self, "", "Önce bu sekmeye gelip spesifikasyonları doldurun.")
+            return
+
+        specs = self._collect_specs()
+        self.btn_opt.setEnabled(False)
+        self.btn_opt.setText("⏳ Optimize ediliyor...")
+        self.status_lbl.setText("Optimizasyon çalışıyor...")
+        self.app.status_bar.showMessage("Diferansiyel evrim optimizasyonu çalışıyor...")
+        QApplication.processEvents()
+
+        self._worker = OptWorker(self.project, specs)
+        self._worker.finished.connect(self._on_opt_done)
+        self._worker.start()
+
+    def _on_opt_done(self, solutions, err):
+        self.btn_opt.setEnabled(True)
+        self.btn_opt.setText("▶  Optimize Et")
+
+        if err:
+            QMessageBox.critical(self, "Hata", f"Optimizasyon hatası:\n{err}")
+            return
+        if not solutions:
+            QMessageBox.warning(self, "Sonuç Yok",
+                "Optimum çözüm bulunamadı. Spesifikasyon sınırlarını genişletin.")
+            return
+
+        self.project.opt_solutions = solutions
+        self._show_solutions(solutions)
+        self._show_robustness(solutions[0])
+        self.status_lbl.setText(
+            f"✅  {len(solutions)} çözüm bulundu  |  "
+            f"En iyi desirability: {solutions[0]['desirability']:.4f}")
+        self.app.status_bar.showMessage(
+            f"Optimizasyon tamamlandı — En iyi D={solutions[0]['desirability']:.4f}", 6000)
+
+    # ── Sonuç gösterimi ───────────────────────────────────────────────────────
+    def _show_solutions(self, solutions):
+        self.result_tabs.clear()
+
+        for rank, sol in enumerate(solutions):
+            d = sol["desirability"]
+            tab_w = QWidget()
+            tab_l = QVBoxLayout(tab_w)
+            tab_l.setContentsMargins(10, 10, 10, 10)
+            tab_l.setSpacing(8)
+
+            # Desirability skoru
+            d_color = GREEN if d >= 0.8 else GOLD if d >= 0.5 else RED
+            d_lbl = QLabel(f"Desirability: {d:.4f}")
+            d_lbl.setStyleSheet(
+                f"color:{d_color}; font-size:16px; font-weight:bold; background:transparent;")
+            tab_l.addWidget(d_lbl)
+
+            # Faktör değerleri
+            tab_l.addWidget(section_label("Faktör Değerleri"))
+            f_tbl = QTableWidget()
+            f_tbl.setColumnCount(3)
+            f_tbl.setHorizontalHeaderLabels(["Faktör", "Değer", "Birim"])
+            f_tbl.horizontalHeader().setSectionResizeMode(
+                QHeaderView.ResizeMode.Stretch)
+            f_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            f_tbl.setFixedHeight(min(200, 36 + 28*len(self.project.factors)))
+            f_tbl.setRowCount(len(self.project.factors))
+
+            for fi, f in enumerate(self.project.factors):
+                val = sol["factors"].get(f["name"], 0)
+                for ci, txt in enumerate([f["name"],
+                                           f"{val:.4f}",
+                                           f.get("unit","")]):
+                    item = QTableWidgetItem(txt)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setBackground(QColor(BG3))
+                    f_tbl.setItem(fi, ci, item)
+            tab_l.addWidget(f_tbl)
+
+            # Tahmin değerleri
+            tab_l.addWidget(section_label("Tahmin Değerleri (CQA)"))
+            p_tbl = QTableWidget()
+            p_tbl.setColumnCount(4)
+            p_tbl.setHorizontalHeaderLabels(["Yanıt", "Tahmin", "LSL", "USL"])
+            p_tbl.horizontalHeader().setSectionResizeMode(
+                QHeaderView.ResizeMode.Stretch)
+            p_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            preds = sol.get("predictions", {})
+            active = [r for r in self.project.responses
+                      if r in self.project.model_results]
+            p_tbl.setRowCount(len(active))
+            p_tbl.setFixedHeight(min(200, 36 + 28*len(active)))
+
+            for pi, resp_key in enumerate(active):
+                pred_val = preds.get(resp_key)
+                spec     = self.project.spec_limits.get(resp_key, {})
+                lsl = spec.get("lsl"); usl = spec.get("usl")
+
+                # Spec kontrolü
+                in_spec = True
+                if pred_val is not None:
+                    if lsl is not None and pred_val < lsl: in_spec = False
+                    if usl is not None and pred_val > usl: in_spec = False
+
+                bg = QColor("#0a2a0a") if in_spec else QColor("#2a0a0a")
+                fg = QColor(GREEN)     if in_spec else QColor(RED)
+
+                items = [
+                    QTableWidgetItem(RESPONSE_LABELS.get(resp_key, resp_key)),
+                    QTableWidgetItem(f"{pred_val:.4f}" if pred_val is not None else "—"),
+                    QTableWidgetItem(f"{lsl:.4f}" if lsl is not None else "—"),
+                    QTableWidgetItem(f"{usl:.4f}" if usl is not None else "—"),
+                ]
+                for ci, item in enumerate(items):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setBackground(bg)
+                    if ci == 1:
+                        item.setForeground(fg)
+                    p_tbl.setItem(pi, ci, item)
+            tab_l.addWidget(p_tbl)
+            tab_l.addStretch()
+
+            d_str = f"{d:.3f}"
+            self.result_tabs.addTab(tab_w, f"#{rank+1}  D={d_str}")
+
+        # Desirability bar grafiği
+        self._plot_desirability(solutions)
+
+    def _plot_desirability(self, solutions):
+        self.fig_d.clear()
+        self.fig_d.patch.set_facecolor(BG2)
+        ax = self.fig_d.add_subplot(111)
+        ax.set_facecolor(BG3)
+        ax.tick_params(colors=TXT2, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#2a4060")
+
+        labels = [f"#{i+1}" for i in range(len(solutions))]
+        values = [s["desirability"] for s in solutions]
+        colors = [GREEN if v >= 0.8 else GOLD if v >= 0.5 else RED for v in values]
+
+        bars = ax.bar(labels, values, color=colors, alpha=0.85,
+                      edgecolor="#2a4060", linewidth=0.8)
+        ax.set_ylim(0, 1.05)
+        ax.axhline(0.8, color=GREEN,  lw=1, linestyle="--", alpha=0.6)
+        ax.axhline(0.5, color=GOLD,   lw=1, linestyle="--", alpha=0.6)
+        ax.set_ylabel("Desirability", color=TXT2, fontsize=8)
+        ax.set_title("Top-5 Desirability Skoru", color=GOLD, fontsize=9)
+
+        for bar, val in zip(bars, values):
+            ax.text(bar.get_x() + bar.get_width()/2, val + 0.02,
+                    f"{val:.3f}", ha="center", va="bottom",
+                    color=TXT, fontsize=8)
+
+        self.fig_d.tight_layout(pad=1.0)
+        self.canvas_d.draw()
+
+    def _show_robustness(self, best_sol):
+        """Optimum ±10% sapma senaryosu."""
+        import statsmodels.api as sm
+        p      = self.project
+        safe   = p.get_safe_names()
+        factors = p.factors
+
+        def encode(val, f):
+            lo, hi = f["low"], f["high"]
+            mid = f.get("mid", (lo+hi)/2)
+            if hi == lo: return 0.0
+            if val <= mid and (mid-lo) != 0:
+                return (val-lo)/(mid-lo) - 1
+            elif (hi-mid) != 0:
+                return (val-mid)/(hi-mid)
+            return 0.0
+
+        def predict_at(resp_key, x_vals):
+            res = p.model_results.get(resp_key)
+            if res is None: return None
+            model = res["model"]
+            row = {}
+            for i, f in enumerate(factors):
+                row[safe[i]] = encode(x_vals[i], f)
+            for name in safe:
+                row[f"{name}_sq"] = row[name]**2
+            for a in range(len(factors)):
+                for b in range(a+1, len(factors)):
+                    row[f"{safe[a]}_x_{safe[b]}"] = row[safe[a]]*row[safe[b]]
+            df_row = pd.DataFrame([row])
+            row_mat = sm.add_constant(df_row, has_constant="add")
+            for col in model.params.index:
+                if col not in row_mat.columns:
+                    row_mat[col] = 0.0
+            row_mat = row_mat.reindex(columns=model.params.index, fill_value=0.0)
+            try:
+                return float(model.predict(row_mat)[0])
+            except Exception:
+                return None
+
+        x_opt  = best_sol["x"]
+        active = [r for r in p.responses if r in p.model_results]
+        self.robust_table.setRowCount(len(active))
+
+        for ri, resp_key in enumerate(active):
+            label = RESPONSE_LABELS.get(resp_key, resp_key)
+            opt_pred = best_sol["predictions"].get(resp_key)
+
+            # ±10% senaryolar
+            preds_low, preds_high = [], []
+            for i, f in enumerate(factors):
+                span = f["high"] - f["low"]
+                step = span * 0.10
+
+                x_lo = list(x_opt); x_lo[i] = max(f["low"], x_opt[i] - step)
+                x_hi = list(x_opt); x_hi[i] = min(f["high"], x_opt[i] + step)
+                pv_lo = predict_at(resp_key, x_lo)
+                pv_hi = predict_at(resp_key, x_hi)
+                if pv_lo is not None: preds_low.append(pv_lo)
+                if pv_hi is not None: preds_high.append(pv_hi)
+
+            lo_val = min(preds_low)  if preds_low  else None
+            hi_val = max(preds_high) if preds_high else None
+
+            spec = p.spec_limits.get(resp_key, {})
+            lsl  = spec.get("lsl"); usl = spec.get("usl")
+
+            def in_spec_check(v):
+                if v is None: return True
+                if lsl is not None and v < lsl: return False
+                if usl is not None and v > usl: return False
+                return True
+
+            items = [
+                QTableWidgetItem(label),
+                QTableWidgetItem(f"{opt_pred:.4f}" if opt_pred is not None else "—"),
+                QTableWidgetItem(f"{lo_val:.4f}"   if lo_val  is not None else "—"),
+                QTableWidgetItem(f"{hi_val:.4f}"   if hi_val  is not None else "—"),
+            ]
+            for ci, item in enumerate(items):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                ok = in_spec_check(lo_val) and in_spec_check(hi_val)
+                item.setBackground(QColor("#0a2a0a" if ok else "#2a1a0a"))
+                if ci in (2, 3):
+                    item.setForeground(QColor(GREEN if ok else GOLD))
+                self.robust_table.setItem(ri, ci, item)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PLACEHOLDER SEKMELER (Adım 5-7 için)
 # ═══════════════════════════════════════════════════════════════════════════════
 class PlaceholderTab(QWidget):
@@ -2297,11 +2922,7 @@ class FormulasyonOptimizerApp(QMainWindow):
         self.tabs.addTab(self.tab4, "4 · Response Surface")
 
         # Sekme 5 — Optimizasyon
-        self.tab5 = PlaceholderTab(
-            "Optimizasyon",
-            "Derringer-Suich desirability fonksiyonu ile\n"
-            "USL/LSL kısıtlarına göre Top-5 optimum formülasyon önerisi.",
-            "🎯")
+        self.tab5 = Tab5_Optimization(self.project, self)
         self.tabs.addTab(self.tab5, "5 · Optimizasyon")
 
         # Sekme 6 — Design Space
