@@ -1259,41 +1259,130 @@ class Tab2_DataEntry(QWidget):
             self, "Excel Dosyası Seç", "", "Excel (*.xlsx *.xls)")
         if not path:
             return
+
         try:
-            df_imp = pd.read_excel(path, engine="openpyxl")
+            import openpyxl
+            wb = openpyxl.load_workbook(path, data_only=True)
+            ws = wb.active
+
+            # Tüm satırları liste olarak oku
+            all_rows = list(ws.values)
+            if not all_rows:
+                QMessageBox.warning(self, "", "Excel dosyası boş.")
+                return
+
+            # Başlık satırını bul — "Run" veya "Run No" içeren ilk satır
+            header_row_idx = None
+            for i, row in enumerate(all_rows):
+                row_strs = [str(c).strip().lower() if c is not None else "" for c in row]
+                if any("run" in s for s in row_strs):
+                    header_row_idx = i
+                    break
+
+            if header_row_idx is None:
+                # Başlık bulunamadıysa ilk satırı başlık say
+                header_row_idx = 0
+
+            headers = [str(c).strip() if c is not None else ""
+                       for c in all_rows[header_row_idx]]
+            data_rows = all_rows[header_row_idx + 1:]
+
         except Exception as e:
             QMessageBox.critical(self, "Hata", f"Dosya okunamadı:\n{e}")
             return
 
-        # Yanıt sütunlarını eşleştir
-        imported = 0
+        # Yanıt sütunlarını eşleştir — hem tam hem kısmi eşleşme
         resps = self.project.responses
         resp_labels = {RESPONSE_LABELS.get(r, r): r for r in resps}
 
-        for ri in range(min(len(df_imp), len(self.project.design_matrix))):
-            for col_name, resp_key in resp_labels.items():
-                # Hem tam isim hem kısmi eşleşme dene
-                matched_col = None
-                for c in df_imp.columns:
-                    if col_name.lower() in str(c).lower() or str(c).lower() in col_name.lower():
-                        matched_col = c
-                        break
-                if matched_col is None:
+        # Her yanıt için hangi sütun indeksine denk geldiğini bul
+        col_map = {}   # resp_key → sütun indeksi
+        for label, resp_key in resp_labels.items():
+            best_col = None
+            best_score = 0
+            label_lo = label.lower().replace(" ", "")
+            for ci, hdr in enumerate(headers):
+                hdr_lo = hdr.lower().replace(" ", "")
+                if not hdr_lo:
                     continue
-                val = df_imp.iloc[ri].get(matched_col, None)
-                if pd.notna(val):
-                    try:
-                        fval = float(val)
-                        if ri not in self.project.run_results:
-                            self.project.run_results[ri] = {}
-                        self.project.run_results[ri][resp_key] = fval
-                        imported += 1
-                    except (ValueError, TypeError):
-                        pass
+                # Tam eşleşme
+                if label_lo == hdr_lo:
+                    best_col = ci
+                    best_score = 3
+                    break
+                # Başlık içinde arama
+                elif label_lo in hdr_lo or hdr_lo in label_lo:
+                    if best_score < 2:
+                        best_col = ci
+                        best_score = 2
+                # İlk kelime eşleşmesi
+                elif label_lo.split("(")[0].strip() in hdr_lo:
+                    if best_score < 1:
+                        best_col = ci
+                        best_score = 1
+            if best_col is not None:
+                col_map[resp_key] = best_col
+
+        if not col_map:
+            QMessageBox.warning(self, "Eşleşme Yok",
+                "Excel sütunları ile yanıt değişkenleri eşleştirilemedi.\n\n"
+                "Lütfen programın oluşturduğu şablonu kullanın.")
+            return
+
+        # "Run No" sütununu bul — sıra eşleştirmesi için
+        run_col = None
+        for ci, hdr in enumerate(headers):
+            if "run" in hdr.lower():
+                run_col = ci
+                break
+
+        imported = 0
+        dm_len = len(self.project.design_matrix) if self.project.design_matrix is not None else 0
+
+        for row in data_rows:
+            if all(c is None for c in row):
+                continue  # Boş satır atla
+
+            # Run indeksini belirle
+            if run_col is not None and run_col < len(row) and row[run_col] is not None:
+                try:
+                    ri = int(float(str(row[run_col]))) - 1  # 1-indexed → 0-indexed
+                except (ValueError, TypeError):
+                    continue
+            else:
+                continue
+
+            if ri < 0 or ri >= dm_len:
+                continue
+
+            # Yanıt değerlerini oku
+            for resp_key, ci in col_map.items():
+                if ci >= len(row):
+                    continue
+                val = row[ci]
+                if val is None or str(val).strip() == "":
+                    continue
+                try:
+                    fval = float(str(val).replace(",", "."))
+                    if ri not in self.project.run_results:
+                        self.project.run_results[ri] = {}
+                    self.project.run_results[ri][resp_key] = fval
+                    imported += 1
+                except (ValueError, TypeError):
+                    pass
 
         self._build_table()
-        QMessageBox.information(self, "İçe Aktarma",
-            f"{imported} değer başarıyla içe aktarıldı.")
+        if imported == 0:
+            QMessageBox.warning(self, "Veri Bulunamadı",
+                "Excel dosyasından hiç veri okunamadı.\n\n"
+                "Olası sebepler:\n"
+                "• Yeşil yanıt sütunları boş bırakılmış\n"
+                "• Sütun başlıkları değiştirilmiş\n"
+                "• Yanlış dosya seçilmiş\n\n"
+                "Lütfen programın oluşturduğu şablonu kullanın.")
+        else:
+            QMessageBox.information(self, "İçe Aktarma Başarılı",
+                f"{imported} değer başarıyla içe aktarıldı.")
         self.app.status_bar.showMessage(f"{imported} değer içe aktarıldı.", 4000)
 
     def _go_to_model(self):
@@ -4533,8 +4622,7 @@ def generate_pdf_report(project, output_path):
         for rk in project.responses:
             res = project.model_results.get(rk)
             if not res: continue
-            story.append(Paragraph(
-                f"2.2 Katsayilar — {RESPONSE_LABELS.get(rk,rk)}", s_h2))
+            # Katsayı tablosu — başlık + tablo aynı sayfada
             model = res["model"]
             cd = [["Terim","Katsayi","Std Hata","t","p"]]
             for nm in model.params.index:
@@ -4549,13 +4637,15 @@ def generate_pdf_report(project, output_path):
             ctt = Table(cd, colWidths=[W*0.35,W*0.16,W*0.16,W*0.16,W*0.17],
                         repeatRows=1)
             ctt.setStyle(tbl_style())
-            story.append(ctt)
-            story.append(Spacer(1, 0.3*cm))
+            story.append(KeepTogether([
+                Paragraph(f"2.2 Katsayilar — {RESPONSE_LABELS.get(rk,rk)}", s_h2),
+                ctt,
+                Spacer(1, 0.3*cm),
+            ]))
 
+            # ANOVA tablosu — başlık + tablo aynı sayfada
             anova = res.get("anova")
             if anova is not None:
-                story.append(Paragraph(
-                    f"2.3 ANOVA — {RESPONSE_LABELS.get(rk,rk)}", s_h2))
                 ad = [["Kaynak","SS","df","MS","p"]]
                 for sn, row in anova.iterrows():
                     pv = row.get("PR(>F)", float("nan"))
@@ -4571,8 +4661,11 @@ def generate_pdf_report(project, output_path):
                 att = Table(ad, colWidths=[W*0.35,W*0.16,W*0.10,W*0.16,W*0.17],
                             repeatRows=1)
                 att.setStyle(tbl_style())
-                story.append(att)
-                story.append(Spacer(1, 0.3*cm))
+                story.append(KeepTogether([
+                    Paragraph(f"2.3 ANOVA — {RESPONSE_LABELS.get(rk,rk)}", s_h2),
+                    att,
+                    Spacer(1, 0.3*cm),
+                ]))
 
     story.append(PageBreak())
 
@@ -4585,14 +4678,18 @@ def generate_pdf_report(project, output_path):
     else:
         for i, rk in enumerate(project.responses):
             if rk not in project.model_results: continue
-            story.append(Paragraph(
-                f"3.{i+1}  {RESPONSE_LABELS.get(rk,rk)}", s_h2))
             img = make_contour(rk)
+            block = [Paragraph(f"3.{i+1}  {RESPONSE_LABELS.get(rk,rk)}", s_h2)]
             if img:
-                story.append(img)
+                block.append(img)
             else:
-                story.append(Paragraph("Grafik olusturulamadi.", s_small))
-            story.append(Spacer(1, 0.3*cm))
+                block.append(Paragraph("Grafik olusturulamadi.", s_small))
+            block.append(Spacer(1, 0.3*cm))
+            try:
+                story.append(KeepTogether(block))
+            except Exception:
+                for el in block:
+                    story.append(el)
     story.append(PageBreak())
 
     # ════════════════════════════════════════
@@ -4618,7 +4715,7 @@ def generate_pdf_report(project, output_path):
         story.append(Spacer(1, 0.4*cm))
 
     if project.opt_solutions:
-        story.append(Paragraph("4.2 Top-5 Optimum Formülasyon", s_h2))
+        story.append(KeepTogether([Paragraph("4.2 Top-5 Optimum Formülasyon", s_h2)]))
         sh2 = (["Sira","Desirability"] +
                [f["name"] for f in project.factors] +
                [RESPONSE_LABELS.get(r,r) for r in project.responses
@@ -4682,7 +4779,7 @@ def generate_pdf_report(project, output_path):
         n_t = len(project.validation_results)
         verdict = f"SONUC: {'PASS' if n_p==n_t else 'KISMI'}  ({n_p}/{n_t})"
         story.append(Paragraph(verdict, s_verdict))
-        story.append(Spacer(1, 0.3*cm))
+        story.append(Spacer(1, 0.2*cm))
         vh = ["Yanit","Tahmin","Gercek","Sapma %","Karar"]
         vd = [vh]
         for rk, vr in project.validation_results.items():
@@ -4701,7 +4798,7 @@ def generate_pdf_report(project, output_path):
             ])
         vt = Table(vd, colWidths=[W*0.30,W*0.17,W*0.17,W*0.17,W*0.19])
         vt.setStyle(tbl_style())
-        story.append(vt)
+        story.append(KeepTogether([vt, Spacer(1, 0.3*cm)]))
     story.append(PageBreak())
 
     # ════════════════════════════════════════
@@ -4851,12 +4948,19 @@ class FormulasyonOptimizerApp(QMainWindow):
         hdr_lay.addStretch()
 
         # Sağ: versiyon + yeni proje butonu
-        ver_lbl = QLabel(
-            "v1.0  |  Ph.Eur 2.9.18 / USP <601>  "
-            "|  Designed by Barbaros Çelik")
+        ver_lbl = QLabel("v1.0  |  Ph.Eur 2.9.18 / USP <601>")
         ver_lbl.setStyleSheet(
-            f"color: #3a5070; font-size: 10px; background: transparent;")
+            "color: #3a5070; font-size: 10px; background: transparent;")
         hdr_lay.addWidget(ver_lbl)
+
+        hdr_lay.addSpacing(12)
+
+        design_lbl = QLabel("Designed by Barbaros Çelik")
+        design_lbl.setStyleSheet(
+            f"color: {GOLD}; font-size: 10px; font-weight: bold; "
+            "background: transparent; padding: 0 6px;")
+        design_lbl.setMinimumWidth(200)
+        hdr_lay.addWidget(design_lbl)
 
         hdr_lay.addSpacing(16)
         btn_pdf = make_btn("📄  PDF Rapor", "rgba(20,80,20,0.5)", 30)
