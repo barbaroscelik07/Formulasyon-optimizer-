@@ -1325,8 +1325,12 @@ class ModelWorker(QThread):
 
         # Yanıt verisini topla
         resp_df = p.build_response_table()
-        if resp_df is None or resp_df.empty:
+        if resp_df is None:
             errors["_global"] = "Yanıt verisi bulunamadı."
+            self.finished.emit(results, errors)
+            return
+        if len(resp_df) == 0:
+            errors["_global"] = "Yanıt tablosu boş."
             self.finished.emit(results, errors)
             return
 
@@ -1337,6 +1341,9 @@ class ModelWorker(QThread):
             self.finished.emit(results, errors)
             return
 
+        # coded_df index'ini sıfırla
+        coded_df = coded_df.reset_index(drop=True)
+
         # Her yanıt için model kur
         for resp_key in p.responses:
             self.progress.emit(f"Model kuruluyor: {RESPONSE_LABELS.get(resp_key, resp_key)}")
@@ -1346,19 +1353,20 @@ class ModelWorker(QThread):
                     errors[resp_key] = "Yanıt sütunu bulunamadı."
                     continue
 
-                y = resp_df[resp_key].values.astype(float)
+                y = np.array(resp_df[resp_key].tolist(), dtype=float)
 
                 # Eksik satırları çıkar (NaN olanlar)
                 mask = ~np.isnan(y)
+                mask_idx = np.where(mask)[0]
                 min_obs = len(safe) + 2
-                if mask.sum() < min_obs:
+                if int(mask.sum()) < min_obs:
                     errors[resp_key] = (
                         f"Yeterli veri yok: {int(mask.sum())} run dolu, "
                         f"en az {min_obs} gerekli.")
                     continue
 
-                X_df    = coded_df[mask].copy().reset_index(drop=True)
-                y_clean = y[mask]
+                X_df    = coded_df.iloc[mask_idx].copy().reset_index(drop=True)
+                y_clean = y[mask_idx]
                 y_s     = pd.Series(y_clean, name=resp_key)
                 n_factors = len(safe)
 
