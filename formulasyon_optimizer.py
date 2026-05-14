@@ -1305,6 +1305,15 @@ class ModelWorker(QThread):
         self.project = project
 
     def run(self):
+        try:
+            self._run_safe()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            write_log(f"ModelWorker crash:\n{tb}")
+            self.finished.emit({}, {"_global": f"Model crash: {e}\n\n{tb}"})
+
+    def _run_safe(self):
         import statsmodels.api as sm
         from statsmodels.stats.anova import anova_lm
         import statsmodels.formula.api as smf
@@ -2332,10 +2341,43 @@ class FormulasyonOptimizerApp(QMainWindow):
 # ═══════════════════════════════════════════════════════════════════════════════
 # GİRİŞ NOKTASI
 # ═══════════════════════════════════════════════════════════════════════════════
+def write_log(msg):
+    """Hata logunu masaüstüne yazar."""
+    import traceback, datetime
+    try:
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        log_path = os.path.join(desktop, "optimizer_log.txt")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"{datetime.datetime.now()}\n")
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+def exception_hook(exc_type, exc_value, exc_tb):
+    import traceback
+    msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    write_log(msg)
+    try:
+        QMessageBox.critical(None, "Hata",
+            f"Beklenmedik hata oluştu:\n\n{exc_value}\n\n"
+            f"Detaylar masaüstündeki optimizer_log.txt dosyasına kaydedildi.")
+    except Exception:
+        pass
+
 def main():
+    sys.excepthook = exception_hook
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
+
+    # Qt exception handler
+    def qt_msg_handler(mode, context, message):
+        if "error" in message.lower() or "critical" in message.lower():
+            write_log(f"Qt mesajı: {message}")
+    from PyQt6.QtCore import qInstallMessageHandler
+    qInstallMessageHandler(qt_msg_handler)
+
     window = FormulasyonOptimizerApp()
     window.show()
     sys.exit(app.exec())
