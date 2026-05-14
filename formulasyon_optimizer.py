@@ -994,7 +994,300 @@ class Tab1_Design(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PLACEHOLDER SEKMELER (Adım 2-7 için)
+# SEKME 2 — VERİ GİRİŞİ
+# ═══════════════════════════════════════════════════════════════════════════════
+class Tab2_DataEntry(QWidget):
+    """Her run için NGI ölçüm sonuçlarını giriş tablosu."""
+
+    def __init__(self, project: OptimizerProject, app_ref, parent=None):
+        super().__init__(parent)
+        self.project = project
+        self.app     = app_ref
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+
+        # ── Üst bilgi çubuğu ────────────────────────────────────────────────
+        info_card = card_frame()
+        info_l = QHBoxLayout(info_card)
+        info_l.setContentsMargins(14, 8, 14, 8)
+        info_l.setSpacing(30)
+        self.lbl_runs    = QLabel("Run: —")
+        self.lbl_factors = QLabel("Faktör: —")
+        self.lbl_resps   = QLabel("Yanıt: —")
+        self.lbl_filled  = QLabel("Dolu: —")
+        for l in [self.lbl_runs, self.lbl_factors, self.lbl_resps, self.lbl_filled]:
+            l.setStyleSheet(f"color:{TXT}; font-size:12px; font-weight:bold; background:transparent;")
+            info_l.addWidget(l)
+        info_l.addStretch()
+
+        self.btn_clear = make_btn("🗑  Temizle", "rgba(120,20,20,0.6)", 28)
+        self.btn_clear.clicked.connect(self._clear_responses)
+        info_l.addWidget(self.btn_clear)
+
+        self.btn_import = make_btn("📂  Excel'den İçe Aktar", "rgba(20,60,100,0.8)", 28)
+        self.btn_import.clicked.connect(self._import_excel)
+        info_l.addWidget(self.btn_import)
+
+        lay.addWidget(info_card)
+
+        # ── Açıklama ────────────────────────────────────────────────────────
+        hint = QLabel(
+            "Her run için NGI ölçüm sonuçlarını girin.  "
+            "Mavi sütunlar = faktör değerleri (salt okunur).  "
+            "Yeşil sütunlar = NGI yanıtları (düzenlenebilir).  "
+            "Boş bırakılan run'lar model kurulumuna dahil edilmez.")
+        hint.setStyleSheet(f"color:{TXT2}; font-size:11px; background:transparent;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        # ── Ana tablo ───────────────────────────────────────────────────────
+        self.table = QTableWidget()
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet(self.table.styleSheet() + """
+            QTableWidget { alternate-background-color: #111620; }
+        """)
+        self.table.cellChanged.connect(self._on_cell_changed)
+        lay.addWidget(self.table, 1)
+
+        # ── Alt butonlar ────────────────────────────────────────────────────
+        bot = QHBoxLayout()
+        bot.setSpacing(10)
+
+        self.lbl_validation = QLabel("")
+        self.lbl_validation.setStyleSheet(f"color:{TXT2}; font-size:11px; background:transparent;")
+        bot.addWidget(self.lbl_validation)
+        bot.addStretch()
+
+        self.btn_next = make_btn("Model Kur  ▶", "rgba(20,80,20,0.8)", 36)
+        self.btn_next.setStyleSheet(self.btn_next.styleSheet() +
+                                    "font-size:13px; font-weight:bold;")
+        self.btn_next.clicked.connect(self._go_to_model)
+        bot.addWidget(self.btn_next)
+        lay.addLayout(bot)
+
+    # ── Yardımcı ──────────────────────────────────────────────────────────────
+    def _n_factor_cols(self):
+        return len(self.project.factors)
+
+    def _resp_col_indices(self):
+        """Yanıt sütunlarının tablo indekslerini döner."""
+        nf = self._n_factor_cols()
+        return list(range(1 + nf, 1 + nf + len(self.project.responses)))
+
+    # ── Public ────────────────────────────────────────────────────────────────
+    def refresh(self):
+        """Sekme 1'den gelindiğinde tabloyu yeniden oluştur."""
+        if self.project.design_matrix is None:
+            self._show_empty()
+            return
+        self._build_table()
+        self._update_info()
+
+    def _show_empty(self):
+        self.table.clear()
+        self.table.setRowCount(1)
+        self.table.setColumnCount(1)
+        self.table.setHorizontalHeaderLabels([""])
+        item = QTableWidgetItem(
+            "Önce 'Deney Tasarımı' sekmesinden matris oluşturun.")
+        item.setForeground(QColor(TXT2))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        self.table.setItem(0, 0, item)
+        self.lbl_runs.setText("Run: —")
+        self.lbl_factors.setText("Faktör: —")
+        self.lbl_resps.setText("Yanıt: —")
+        self.lbl_filled.setText("Dolu: —")
+
+    def _build_table(self):
+        """Design matrix + boş yanıt sütunlarıyla tabloyu oluştur."""
+        self.table.blockSignals(True)
+        df      = self.project.design_matrix
+        factors = self.project.factors
+        resps   = self.project.responses
+        n_runs  = len(df)
+
+        # Sütunlar: Run No | faktörler... | yanıtlar...
+        headers = ["Run"] + \
+                  [f"{f['name']}" + (f"\n({f['unit']})" if f.get("unit") else "")
+                   for f in factors] + \
+                  [RESPONSE_LABELS.get(r, r) for r in resps]
+
+        self.table.setColumnCount(len(headers))
+        self.table.setRowCount(n_runs)
+        self.table.setHorizontalHeaderLabels(headers)
+
+        nf = len(factors)
+
+        for ri in range(n_runs):
+            # Run no
+            item = QTableWidgetItem(str(ri + 1))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setBackground(QColor("#1F4E79"))
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.table.setItem(ri, 0, item)
+
+            # Faktör değerleri — salt okunur, mavi
+            for ci, f in enumerate(factors):
+                val = df.iloc[ri][f["name"]]
+                item = QTableWidgetItem(f"{val:.4f}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setBackground(QColor("#0d1e36"))
+                item.setForeground(QColor("#90b8e0"))
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self.table.setItem(ri, 1 + ci, item)
+
+            # Yanıt sütunları — düzenlenebilir, yeşil tonu
+            for ci, resp in enumerate(resps):
+                col_idx = 1 + nf + ci
+                existing = self.project.run_results.get(ri, {}).get(resp, "")
+                val_str = f"{existing:.6g}" if isinstance(existing, float) else ""
+                item = QTableWidgetItem(val_str)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setBackground(QColor("#0d2010"))
+                item.setForeground(QColor(TXT))
+                self.table.setItem(ri, col_idx, item)
+
+        self.table.blockSignals(False)
+        self._update_info()
+
+    def _on_cell_changed(self, row, col):
+        """Yanıt hücresi değiştiğinde project.run_results güncelle."""
+        nf = self._n_factor_cols()
+        resp_start = 1 + nf
+        if col < resp_start:
+            return
+        resp_idx = col - resp_start
+        if resp_idx >= len(self.project.responses):
+            return
+        resp_key = self.project.responses[resp_idx]
+        item = self.table.item(row, col)
+        if item is None:
+            return
+        txt = item.text().strip().replace(",", ".")
+        if txt == "":
+            # Boş — sil
+            if row in self.project.run_results:
+                self.project.run_results[row].pop(resp_key, None)
+        else:
+            try:
+                val = float(txt)
+                if row not in self.project.run_results:
+                    self.project.run_results[row] = {}
+                self.project.run_results[row][resp_key] = val
+                # Hücre rengini dolu olarak işaretle
+                item.setBackground(QColor("#0a2e14"))
+                item.setForeground(QColor("#80e890"))
+            except ValueError:
+                item.setBackground(QColor("#3a0a0a"))
+                item.setForeground(QColor("#ff6060"))
+        self._update_info()
+
+    def _update_info(self):
+        df    = self.project.design_matrix
+        resps = self.project.responses
+        if df is None:
+            return
+        n_runs  = len(df)
+        n_resps = len(resps)
+        # Kaç run'da en az 1 yanıt dolu?
+        filled = sum(1 for i in range(n_runs)
+                     if any(isinstance(self.project.run_results.get(i, {}).get(r), float)
+                            for r in resps))
+        self.lbl_runs.setText(f"Run: {n_runs}")
+        self.lbl_factors.setText(f"Faktör: {len(self.project.factors)}")
+        self.lbl_resps.setText(f"Yanıt: {n_resps}")
+        color = GREEN if filled == n_runs else GOLD if filled > 0 else TXT2
+        self.lbl_filled.setStyleSheet(
+            f"color:{color}; font-size:12px; font-weight:bold; background:transparent;")
+        self.lbl_filled.setText(f"Dolu: {filled}/{n_runs}")
+
+        # Doğrulama mesajı
+        if filled == 0:
+            msg = "Henüz veri girilmedi."
+            self.lbl_validation.setStyleSheet(f"color:{TXT2}; font-size:11px; background:transparent;")
+        elif filled < n_runs:
+            eksik = n_runs - filled
+            msg = f"⚠  {eksik} run eksik — model kurulabilir ama dikkatli değerlendirin."
+            self.lbl_validation.setStyleSheet(f"color:{GOLD}; font-size:11px; background:transparent;")
+        else:
+            msg = f"✅  Tüm {n_runs} run tamamlandı — Model Kur'a geçebilirsiniz."
+            self.lbl_validation.setStyleSheet(f"color:{GREEN}; font-size:11px; background:transparent;")
+        self.lbl_validation.setText(msg)
+
+    def _clear_responses(self):
+        reply = QMessageBox.question(
+            self, "Temizle",
+            "Tüm yanıt değerleri silinecek. Devam edilsin mi?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.project.run_results = {}
+            self.project.model_results = {}
+            self._build_table()
+
+    def _import_excel(self):
+        """Excel dosyasından yanıt değerlerini içe aktar."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Excel Dosyası Seç", "", "Excel (*.xlsx *.xls)")
+        if not path:
+            return
+        try:
+            df_imp = pd.read_excel(path, engine="openpyxl")
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Dosya okunamadı:\n{e}")
+            return
+
+        # Yanıt sütunlarını eşleştir
+        imported = 0
+        resps = self.project.responses
+        resp_labels = {RESPONSE_LABELS.get(r, r): r for r in resps}
+
+        for ri in range(min(len(df_imp), len(self.project.design_matrix))):
+            for col_name, resp_key in resp_labels.items():
+                # Hem tam isim hem kısmi eşleşme dene
+                matched_col = None
+                for c in df_imp.columns:
+                    if col_name.lower() in str(c).lower() or str(c).lower() in col_name.lower():
+                        matched_col = c
+                        break
+                if matched_col is None:
+                    continue
+                val = df_imp.iloc[ri].get(matched_col, None)
+                if pd.notna(val):
+                    try:
+                        fval = float(val)
+                        if ri not in self.project.run_results:
+                            self.project.run_results[ri] = {}
+                        self.project.run_results[ri][resp_key] = fval
+                        imported += 1
+                    except (ValueError, TypeError):
+                        pass
+
+        self._build_table()
+        QMessageBox.information(self, "İçe Aktarma",
+            f"{imported} değer başarıyla içe aktarıldı.")
+        self.app.status_bar.showMessage(f"{imported} değer içe aktarıldı.", 4000)
+
+    def _go_to_model(self):
+        """Sekme 3'e geç."""
+        filled = sum(1 for i in range(len(self.project.design_matrix or []))
+                     if self.project.run_results.get(i))
+        if filled == 0:
+            QMessageBox.warning(self, "",
+                "Model kurmak için en az birkaç run verisi gereklidir.")
+            return
+        self.app.tabs.setCurrentIndex(2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PLACEHOLDER SEKMELER (Adım 3-7 için)
 # ═══════════════════════════════════════════════════════════════════════════════
 class PlaceholderTab(QWidget):
     """Henüz geliştirilmemiş sekmeler için yer tutucu."""
@@ -1107,12 +1400,8 @@ class FormulasyonOptimizerApp(QMainWindow):
         self.tab1.design_generated.connect(self._on_design_generated)
         self.tabs.addTab(self.tab1, "1 · Deney Tasarımı")
 
-        # Sekme 2 — Veri Girişi (placeholder)
-        self.tab2 = PlaceholderTab(
-            "Veri Girişi",
-            "Deney matrisi oluşturulduktan sonra her run için\n"
-            "NGI ölçüm sonuçlarını (MMAD, FPF vb.) bu sekmeden gireceksiniz.",
-            "📝")
+        # Sekme 2 — Veri Girişi
+        self.tab2 = Tab2_DataEntry(self.project, self)
         self.tabs.addTab(self.tab2, "2 · Veri Girişi")
 
         # Sekme 3 — Model
