@@ -1295,31 +1295,51 @@ class Tab2_DataEntry(QWidget):
         resps = self.project.responses
         resp_labels = {RESPONSE_LABELS.get(r, r): r for r in resps}
 
+        # Karşılaştırma için özel karakterleri normalize et
+        def normalize(s):
+            """Özel karakterleri kaldır, küçük harf, boşluksuz."""
+            import re
+            s = str(s).lower()
+            # Türkçe ve özel karakterler
+            s = s.replace("µ", "u").replace("μ", "u")
+            s = s.replace("<", "").replace(">", "")
+            s = s.replace("(", "").replace(")", "")
+            s = s.replace("%", "pct").replace("/", "")
+            s = re.sub(r"[^a-z0-9]", "", s)
+            return s
+
         # Her yanıt için hangi sütun indeksine denk geldiğini bul
         col_map = {}   # resp_key → sütun indeksi
         for label, resp_key in resp_labels.items():
             best_col = None
             best_score = 0
-            label_lo = label.lower().replace(" ", "")
+            label_n = normalize(label)
+            # Kısa anahtar kelimeler (parantez öncesi)
+            label_key = normalize(label.split("(")[0].split("<")[0])
+
             for ci, hdr in enumerate(headers):
-                hdr_lo = hdr.lower().replace(" ", "")
-                if not hdr_lo:
+                if not hdr:
                     continue
-                # Tam eşleşme
-                if label_lo == hdr_lo:
-                    best_col = ci
-                    best_score = 3
-                    break
-                # Başlık içinde arama
-                elif label_lo in hdr_lo or hdr_lo in label_lo:
+                hdr_n = normalize(hdr)
+                if not hdr_n:
+                    continue
+
+                # Tam normalize eşleşme
+                if label_n == hdr_n:
+                    best_col = ci; best_score = 4; break
+                # Anahtar kelime tam eşleşme
+                elif label_key and label_key == hdr_n:
+                    if best_score < 3:
+                        best_col = ci; best_score = 3
+                # İçinde geçme
+                elif label_n in hdr_n or hdr_n in label_n:
                     if best_score < 2:
-                        best_col = ci
-                        best_score = 2
-                # İlk kelime eşleşmesi
-                elif label_lo.split("(")[0].strip() in hdr_lo:
+                        best_col = ci; best_score = 2
+                # Anahtar kelime içinde geçme
+                elif label_key and label_key in hdr_n:
                     if best_score < 1:
-                        best_col = ci
-                        best_score = 1
+                        best_col = ci; best_score = 1
+
             if best_col is not None:
                 col_map[resp_key] = best_col
 
